@@ -1,10 +1,6 @@
-﻿$VMs = Get-VM
-foreach ($VM in $VMs) {
-    $VMName = $VM.Name
-    $CDDrive = $VM | Get-CDDrive
-    $ISOPath = $CDDrive.ISOPath
-    if ($ISOPath) {
-        Write-Host "$VMName has ISO mounted: $ISOPath"
-        Select-Object -InputObject $VMName -Property @{Name="VMName";Expression={$VMName}},@{Name="ISOPath";Expression={$ISOPath}} | Export-Csv -Path .\MountedISOs.csv -Append -NoTypeInformation
+Get-VM -ErrorAction Stop | ForEach-Object {
+    $vm = $_
+    foreach ($drive in ($vm | Get-CDDrive | Where-Object IsoPath)) {
+        [pscustomobject]@{ VMName = $vm.Name; VMId = $vm.Id; InstanceUuid = $vm.ExtensionData.Client.ServiceContent.About.InstanceUuid; DriveId = $drive.Id; ISOPath = $drive.IsoPath }
     }
-}
+} | Export-Csv ./MountedISOs.csv
