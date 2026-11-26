@@ -1,56 +1,34 @@
-﻿function Set-DPM {
-    <#
-    .SYNOPSIS
-    Enables Distributed Power Management on a cluster
-    .DESCRIPTION
-    This function will allow you to configure
-    DPM on an existing vCenter Server cluster
-    .NOTES
-    Source:  Automating vSphere Administration
-    .PARAMETER Cluster
-    The cluster on which to set DPM configuration
-    .PARAMETER Behavior
-    DPM Behavior, this can be set to "off", "manual" or "Automated", by default it is "off"
-    .EXAMPLE
-    Set-DPM -Cluster "Cluster01" -Behavior "Automated"
-    #>
-    param(
-    [String]$Cluster,
-    [String]$Behavior
-    )
+[CmdletBinding()]
+param(
+    $Server,
+    [string]$Cluster = 'Cluster01',
+    [ValidateSet('Off', 'Manual', 'Automated')][string]$Behavior = 'Automated'
+)
 
-    Process {
-        switch ($Behavior) {
-            "Off" {
-                $DPMBehavior = "Automated"
-                $Enabled = $false
-            }
-            "Automated" {
-                $DPMBehavior = "Automated"
-                $Enabled = $true
-            }
-            "Manual" {
-                $DPMBehavior = "Manual"
-                $Enabled = $true
-            }
-            default {
-                $DPMBehavior = "Automated"
-                $Enabled = $false
-            }
-        }
-        $clus = Get-Cluster $Cluster | Get-View –Property Name
-        $spec = New-Object VMware.Vim.ClusterConfigSpecEx
-        $spec.dpmConfig = New-Object VMware.Vim.ClusterDpmConfigInfo
-        $spec.DpmConfig.DefaultDpmBehavior = $DPMBehavior
-        $spec.DpmConfig.Enabled = $Enabled
-        $clus.ReconfigureComputeResource_Task($spec, $true)
-        $clus.UpdateViewData("ConfigurationEx")
-        New-Object -TypeName PSObject -Property @{
-            Cluster = $clus.Name;
-            DPMEnabled = $clus.ConfigurationEx.DpmConfigInfo.Enabled;
-            DefaultDpmBehavior = $clus.ConfigurationEx.DpmConfigInfo.DefaultDpmBehavior
-        }
+$ErrorActionPreference = 'Stop'
+
+function Set-DPM {
+    param([string]$Cluster, [ValidateSet('Off', 'Manual', 'Automated')][string]$Behavior, $Server)
+    if (!$Cluster -or !$Behavior) { throw 'Supply Cluster and Behavior.' }
+    if (-not $Server) {
+        $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+        $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+        if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+        $Server = $connections[0]
     }
-}
+    if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
 
-Set-DPM -Cluster "Cluster01" -Behavior "Automated"
+    $targets = @(Get-Cluster -Server $Server | Where-Object Name -CEQ $Cluster)
+    if ($targets.Count -ne 1) { throw "Expected one cluster named $Cluster." }
+    $view = $targets[0].ExtensionData
+    $spec = [VMware.Vim.ClusterConfigSpecEx]::new()
+    $spec.DpmConfig = [VMware.Vim.ClusterDpmConfigInfo]::new()
+    $spec.DpmConfig.Enabled = $Behavior -ne 'Off'
+    if ($spec.DpmConfig.Enabled) { $spec.DpmConfig.DefaultDpmBehavior = $Behavior.ToLowerInvariant() }
+    $task = $view.ReconfigureComputeResource_Task($spec, $true)
+    Get-Task -Server $Server -Id "Task-$($task.Value)" | Wait-Task -ErrorAction Stop | Out-Null
+    $view.UpdateViewData('ConfigurationEx.DpmConfigInfo')
+    [pscustomobject]@{Cluster = $view.Name; DPMEnabled = $view.ConfigurationEx.DpmConfigInfo.Enabled; DefaultDpmBehavior = $view.ConfigurationEx.DpmConfigInfo.DefaultDpmBehavior }
+}
+if ($MyInvocation.InvocationName -ne '.') { Set-DPM -Cluster $Cluster -Behavior $Behavior -Server $Server }
