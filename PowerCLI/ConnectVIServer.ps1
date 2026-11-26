@@ -1,4 +1,9 @@
-### CONNECT TO VCENTER ###
-$vCenterServer = "10.10.10.10"
-$vCenterCred   = Get-Credential -Message "Enter vCenter credentials"
-Connect-VIServer -Server $vCenterServer -Protocol https -Credential $vCenterCred
+[CmdletBinding()]
+param(
+    [string]$Server,
+    [pscredential]$Credential
+)
+
+$ErrorActionPreference = 'Stop'
+if (!$Server -or !$Credential) { throw 'Supply -Server and -Credential.' }
+Connect-VIServer -Server $Server -Credential $Credential -Protocol https -Force
