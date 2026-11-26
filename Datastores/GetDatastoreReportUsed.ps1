@@ -1,16 +1,3 @@
-﻿Get-Datastore | Select-Object `
-    @{N='Datastore';E={$script:p = [math]::Round(($_.CapacityGB - $_.FreeSpaceGB)/$_.CapacityGB*100,1)
-        if ($p -lt 70){
-            "#fg#$($_.Name)#fe#"
-        }
-        elseif ($p -lt 90){
-            "#fy#$($_.Name)#fe#"
-        }
-        else {
-            "#fr#$($_.Name)#fe#"
-        }
-    }
-},
-@{N='CapacityGB';E={[math]::Round($_.CapacityGB,1)}},
-@{N='FreeSpaceGB';E={[math]::Round($_.FreeSpaceGB,1)}},
-@{N='UsedPercent';E={$script:p}} | Export-Csv .\DataStoreReport.csv -NoTypeInformation
+Get-Datastore -ErrorAction Stop | Select-Object @{Name = 'Datastore'; Expression = { $_.Name } }, CapacityGB, FreeSpaceGB,
+@{Name = 'UsedPercent'; Expression = { if ($_.CapacityGB -gt 0) { [math]::Round(100 * ($_.CapacityGB - $_.FreeSpaceGB) / $_.CapacityGB, 1) } } } |
+    Export-Csv ./DataStoreUsedReport.csv
