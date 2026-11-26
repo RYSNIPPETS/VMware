@@ -1,28 +1,32 @@
-﻿$report = @()
-$cnt = 1
-Measure-Command {
-    $view = Get-View -ViewType Virtualmachine -Property Name,Config,Guest
-    Write-Host "Found $($view.count) virtual machines"
-    $events = Get-VIEvent -Entity $view.Name -MaxSamples ([int]::MaxValue) |
-        Where-Object { $_ -is [VMware.Vim.VmDeployedEvent] -or
-                       $_ -is [VMware.Vim.VmClonedEvent]-or
-                       $_ -is [VMware.Vim.VmCreatedEvent]-or
-                       $_ -is [VMware.Vim.VmRegisteredEvent]}
+[CmdletBinding()]
+param(
+    $Server
+)
 
-    foreach ($vm in $view ) {
-        if (!$vm.Config) { continue }
-        Write-Host "Processing $($cnt) - $($vm.Name)"
-        $vms = [PSCustomObject]@{
-            VMName      = $vm.Name
-            Hostname    = $vm.guest.hostname
-            OS          = $vm.Config.GuestFullName
-            IPAddress   = $vm.guest.ipAddress
-            CreatedDate = $vm.Config.CreateDate
-            Creator     = ($events | Where-Object {$_.VM.Name -eq $vm.Name} | Sort-Object -Property CreatedTime -Descending | Select-Object -First 1).UserName
-            Notes       = $vm.Config.Annotation -replace '(?:\r|\n)', ''
-        }
-        $report += $vms
-        $cnt++
+$ErrorActionPreference = 'Stop'
+
+if (-not $Server) {
+    $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+    $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+    if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+    $Server = $connections[0]
+}
+if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+
+foreach ($vm in (Get-VM -Server $Server)) {
+    $view = $vm.ExtensionData
+    $entry = Get-VIEvent -Server $Server -Entity $vm -MaxSamples ([int]::MaxValue) | Where-Object {
+        $_.Vm.Vm.Value -eq $view.MoRef.Value -and $_.GetType().Name -in 'VmCreatedEvent', 'VmClonedEvent', 'VmDeployedEvent'
+    } | Sort-Object CreatedTime | Select-Object -First 1
+    [pscustomobject]@{
+        VMName      = $vm.Name
+        VMId        = $vm.Id
+        Hostname    = $view.Guest.HostName
+        OS          = $view.Config.GuestFullName
+        IPAddress   = $view.Guest.IpAddress
+        CreatedDate = $view.Config.CreateDate
+        Creator     = $entry.UserName
+        Notes       = $view.Config.Annotation -replace '[\r\n]', ''
     }
 }
-$report

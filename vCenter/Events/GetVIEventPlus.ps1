@@ -1,4 +1,4 @@
-﻿function Get-VIEventPlus {
+function Get-VIEventPlus {
     <#
         .SYNOPSIS  Returns vSphere events
         .DESCRIPTION The function will return vSphere events. With
@@ -36,7 +36,7 @@
         PS> Get-VIEventPlus -Entity $cluster -Recurse:$true
     #>
     param(
-        [VMware.VimAutomation.ViCore.Impl.V1.Inventory.InventoryItemImpl[]]$Entity,
+        [object[]]$Entity,
         [string[]]$EventType,
         [DateTime]$Start,
         [DateTime]$Finish = (Get-Date),
@@ -44,54 +44,72 @@
         [string[]]$User,
         [Switch]$System,
         [string]$ScheduledTask,
-        [switch]$FullMessage = $false
+        [switch]$FullMessage = $false,
+        $Server
     )
     process {
         $eventnumber = 100
-        $events = @()
-        $eventMgr = Get-View EventManager
+        $ErrorActionPreference = 'Stop'
+        if (-not $Server) {
+            $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+            if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+            $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+            if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+            $Server = $connections[0]
+        }
+        if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+
+        $instance = Get-View ServiceInstance -Server $Server
+        $eventMgr = Get-View EventManager -Server $Server
         $eventFilter = New-Object VMware.Vim.EventFilterSpec
         $eventFilter.disableFullMessage = ! $FullMessage
-        $eventFilter.entity = New-Object VMware.Vim.EventFilterSpecByEntity
-        $eventFilter.entity.recursion = &{if($Recurse){"all"}else{"self"}}
         $eventFilter.eventTypeId = $EventType
-        if($Start -or $Finish){
+        if ($Start -or $Finish) {
             $eventFilter.time = New-Object VMware.Vim.EventFilterSpecByTime
-            if($Start){
+            if ($Start) {
                 $eventFilter.time.beginTime = $Start
             }
-            if($Finish){
+            if ($Finish) {
                 $eventFilter.time.endTime = $Finish
             }
         }
-        if($User -or $System){
+        if ($User -or $System) {
             $eventFilter.UserName = New-Object VMware.Vim.EventFilterSpecByUsername
-            if($User){
+            if ($User) {
                 $eventFilter.UserName.userList = $User
             }
-            if($System){
+            if ($System) {
                 $eventFilter.UserName.systemUser = $System
             }
         }
-        if($ScheduledTask){
-            $si = Get-View ServiceInstance
-            $schTskMgr = Get-View $si.Content.ScheduledTaskManager
-            $eventFilter.ScheduledTask = Get-View $schTskMgr.ScheduledTask | Where-Object {$_.Info.Name -match $ScheduledTask} | Select-Object -First 1 | Select-Object -ExpandProperty MoRef
+        if ($ScheduledTask) {
+            $manager = Get-View -Id $instance.Content.ScheduledTaskManager -Server $Server
+            $tasks = @(foreach ($ref in $manager.ScheduledTask) {
+                    Get-View -Id $ref -Server $Server | Where-Object { $_.Info.Name -ceq $ScheduledTask }
+                })
+            if ($tasks.Count -ne 1) { throw 'Expected one matching scheduled task.' }
+            $eventFilter.ScheduledTask = $tasks[0].MoRef
         }
-        if(!$Entity){
-            $Entity = @(Get-Folder -Name Datacenters)
-        }
-        $entity | ForEach-Object {
-            $eventFilter.entity.entity = $_.ExtensionData.MoRef
-            $eventCollector = Get-View ($eventMgr.CreateCollectorForEvents($eventFilter))
-            $eventsBuffer = $eventCollector.ReadNextEvents($eventnumber)
-            while($eventsBuffer){
-                $events += $eventsBuffer
-                $eventsBuffer = $eventCollector.ReadNextEvents($eventnumber)
+        $seen = [System.Collections.Generic.HashSet[int]]::new()
+        $targets = @($Entity)
+        if (!$Entity) { $targets = , $null }
+        foreach ($item in $targets) {
+            if ($item) {
+                if ($item.ExtensionData.Client.ServiceContent.About.InstanceUuid -ne $instance.Content.About.InstanceUuid) { throw 'Entity belongs to a different vCenter.' }
+                $eventFilter.Entity = [VMware.Vim.EventFilterSpecByEntity]::new()
+                $eventFilter.Entity.Entity = $item.ExtensionData.MoRef
+                $eventFilter.Entity.Recursion = if ($Recurse) { 'all' } else { 'self' }
             }
-            $eventCollector.DestroyCollector()
+            $ref = $eventMgr.CreateCollectorForEvents($eventFilter)
+            $collector = Get-View -Id $ref -Server $Server
+            try {
+                do {
+                    $batch = $collector.ReadNextEvents($eventnumber)
+                    foreach ($entry in $batch) { if ($seen.Add($entry.Key)) { $entry } }
+                } while ($batch)
+            }
+            finally { $collector.DestroyCollector() }
         }
-        $events
     }
 }
 function Get-MotionHistory {
@@ -126,22 +144,23 @@ function Get-MotionHistory {
         PS> Get-Datacenter -Name $dcName |
         >> Get-MotionHistory -Days 7 -Sort:$false
     #>
+    [CmdletBinding(DefaultParameterSetName = "Days")]
     param(
-        [CmdletBinding(DefaultParameterSetName="Days")]
-        [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
-        [VMware.VimAutomation.ViCore.Impl.V1.Inventory.InventoryItemImpl[]]$Entity,
-        [Parameter(ParameterSetName='Days')]
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [object[]]$Entity,
+        [Parameter(ParameterSetName = 'Days')]
         [int]$Days = 1,
-        [Parameter(ParameterSetName='Hours')]
+        [Parameter(ParameterSetName = 'Hours')]
         [int]$Hours,
-        [Parameter(ParameterSetName='Minutes')]
+        [Parameter(ParameterSetName = 'Minutes')]
         [int]$Minutes,
         [switch]$Recurse = $false,
-        [switch]$Sort = $true
+        [switch]$Sort,
+        $Server
     )
-    begin{
+    begin {
         $history = @()
-        switch($psCmdlet.ParameterSetName){
+        switch ($psCmdlet.ParameterSetName) {
             'Days' {
                 $start = (Get-Date).AddDays(- $Days)
             }
@@ -152,22 +171,22 @@ function Get-MotionHistory {
                 $start = (Get-Date).AddMinutes(- $Minutes)
             }
         }
-        $eventTypes = "DrsVmMigratedEvent","VmMigratedEvent"
+        $eventTypes = "DrsVmMigratedEvent", "VmMigratedEvent"
     }
-    process{
-        $history += Get-VIEventPlus -Entity $entity -Start $start -EventType $eventTypes -Recurse:$Recurse | Select-Object CreatedTime,@{N="Type";E={if($_.SourceDatastore.Name -eq $_.Ds.Name){"vMotion"}else{"svMotion"}}},
-        @{N="UserName";E={if($_.UserName){$_.UserName}else{"System"}}},
-        @{N="VM";E={$_.VM.Name}},
-        @{N="SrcVMHost";E={$_.SourceHost.Name.Split('.')[0]}},
-        @{N="TgtVMHost";E={if($_.Host.Name -ne $_.SourceHost.Name){$_.Host.Name.Split('.')[0]}}},
-        @{N="SrcDatastore";E={$_.SourceDatastore.Name}},
-        @{N="TgtDatastore";E={if($_.Ds.Name -ne $_.SourceDatastore.Name){$_.Ds.Name}}}
+    process {
+        $history += Get-VIEventPlus -Entity $entity -Server $Server -Start $start -EventType $eventTypes -Recurse:$Recurse | Select-Object CreatedTime, @{N = "Type"; E = { if ($_.SourceDatastore.Name -eq $_.Ds.Name) { "vMotion" }else { "svMotion" } } },
+        @{N = "UserName"; E = { if ($_.UserName) { $_.UserName }else { "System" } } },
+        @{N = "VM"; E = { $_.VM.Name } },
+        @{N = "SrcVMHost"; E = { $_.SourceHost.Name.Split('.')[0] } },
+        @{N = "TgtVMHost"; E = { if ($_.Host.Name -ne $_.SourceHost.Name) { $_.Host.Name.Split('.')[0] } } },
+        @{N = "SrcDatastore"; E = { $_.SourceDatastore.Name } },
+        @{N = "TgtDatastore"; E = { if ($_.Ds.Name -ne $_.SourceDatastore.Name) { $_.Ds.Name } } }
     }
-    end{
-        if($Sort){
+    end {
+        if (!$PSBoundParameters.ContainsKey('Sort') -or $Sort) {
             $history | Sort-Object -Property CreatedTime
         }
-        else{
+        else {
             $history
         }
     }
