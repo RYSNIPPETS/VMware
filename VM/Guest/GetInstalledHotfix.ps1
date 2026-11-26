@@ -1,53 +1,29 @@
-# Get-WmiObject was deprecated in PowerShell 6 and removed in PowerShell 7+.
-# Use Get-CimInstance instead.
-# Update $HotfixIDs below with the KB numbers relevant to your environment.
-
-$HotfixIDs = @(
-    "KB5040442",
-    "KB5039894"
-    # Add additional KB IDs as needed
+[CmdletBinding()]
+param(
+    [string]$ResourcePool = 'testpool',
+    [ValidatePattern('^KB[0-9]+$')][string[]]$HotfixIDs = @('KB5040442', 'KB5039894'),
+    [pscredential]$GuestCredential,
+    [string]$OutputPath = './Output.csv'
 )
 
-$script = @"
-  `$hotfix = @('$($HotfixIDs -join "','")')
-  `$fixes  = Get-CimInstance -ClassName Win32_QuickFixEngineering |
-             Where-Object { `$hotfix -contains `$_.HotFixID } |
-             Select-Object -ExpandProperty HotFixID
-  if (`$fixes) { "`$(`$fixes -join ',') installed" }
-  else         { "No matching hotfixes found" }
-"@
-
-# Prompt for guest credentials — supports a single credential set.
-# If your environment has VMs with different local admin passwords, call
-# Get-Credential multiple times and build the $accounts array accordingly.
-$cred = Get-Credential -Message "Enter guest VM Administrator credentials"
-$accounts = @(
-    @{ User = $cred.UserName; Pswd = $cred.GetNetworkCredential().Password }
-)
-
-Get-ResourcePool -Name 'testpool' -PipelineVariable rp | ForEach-Object {
-    Get-VM -Location $rp -PipelineVariable vm | ForEach-Object {
-        $out = 'Login failed'
-        foreach ($account in $accounts) {
-            try {
-                $sInvoke = @{
-                    VM            = $vm
-                    GuestUser     = $account.User
-                    GuestPassword = $account.Pswd
-                    ScriptText    = $script
-                    ScriptType    = 'Powershell'
-                    ErrorAction   = 'Stop'
-                }
-                $out = Invoke-VMScript @sInvoke | Select-Object -ExpandProperty ScriptOutput
-                break
-            } catch {}
+$ErrorActionPreference = 'Stop'
+if (!$GuestCredential) { throw 'Supply -GuestCredential.' }
+$filter = $HotfixIDs -join "','"
+$guestScript = @'
+$ErrorActionPreference = 'Stop'
+$wanted = @('HOTFIXES')
+Get-CimInstance Win32_QuickFixEngineering | Where-Object { $wanted -contains $_.HotFixID } | Select-Object -ExpandProperty HotFixID
+'@
+Get-ResourcePool -Name $ResourcePool | ForEach-Object {
+    $pool = $_
+    Get-VM -Location $pool | ForEach-Object {
+        $vm = $_
+        try {
+            $result = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential -ScriptType Powershell -ScriptText $guestScript.Replace('HOTFIXES', $filter)
+            if ($result.ExitCode -ne 0) { throw "Guest exited $($result.ExitCode): $($result.ScriptOutput)" }
+            $message = if ($result.ScriptOutput.Trim()) { ($result.ScriptOutput.Trim() -split '\r?\n') -join ', ' } else { 'No matching hotfixes found' }
         }
-        [PSCustomObject][ordered]@{
-            Name   = $vm.Name
-            OS     = $vm.Guest.OSFullName
-            IP     = $vm.Guest.IPAddress -join '|'
-            RP     = $rp.Name
-            Result = $out
-        }
+        catch { $message = "Query failed: $($_.Exception.Message)" }
+        [pscustomobject]@{ Name = $vm.Name; OS = $vm.Guest.OSFullName; IP = $vm.Guest.IPAddress -join '|'; RP = $pool.Name; Result = $message }
     }
-} | Export-Csv -Path .\Output.csv -NoTypeInformation -NoClobber
+} | Export-Csv -LiteralPath $OutputPath
