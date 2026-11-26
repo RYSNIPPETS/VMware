@@ -1,208 +1,120 @@
-# Deploy Windows Server 2019/2022 in vCenter
-#### USER DEFINED VARIABLES ############################################################################################
-$Domain = ""              #AD Domain to join
-$vCenterInstance = ""     #vCenter to deploy VM
-$Cluster = ""             #vCenter cluster to deploy VM
-$VMTemplate = ""          #vCenter template to deploy VM
-$CustomSpec = ""          #vCenter customization to use for VM
-$Location = ""            #Folderlocation in vCenter for VM
-$DataStore = ""           #Datastore in vCenter to use for VM
-$DiskStorageFormat = ""   #Diskformtat to use (Thin / Thick) for VM
-$NetworkName = ""         #Portgroup to use for VM
-$Memory =                 #Memory of VM In GB
-$CPU =                    #number of vCPUs of VM
-$DiskCapacity =           #Disksize of VM in GB
-$SubnetLength =           #Subnetlength IP address to use (24 means /24 or 255.255.255.0) for VM
-$GW = ""                  #Gateway to use for VM
-$IP_DNS = ""              #IP address DNS server to use
+<#
+.SYNOPSIS
+Clones a Windows VM and applies a per-VM customization specification.
+.DESCRIPTION
+Uses an existing vCenter connection or the supplied vCenter credential. Static IPv4 and domain membership are applied by guest customization. Optional firewall changes require the guest credential.
+#>
+[CmdletBinding()]
+param(
+    [Alias('vCenterInstance')][string]$Server,
+    [pscredential]$vCenterCredential,
+    [ValidatePattern('^(?!-)[A-Za-z0-9-]{1,15}(?<!-)$')][string]$Hostname,
+    [string]$Cluster,
+    [string]$VMTemplate,
+    [string]$CustomSpec,
+    [string]$Location,
+    [string]$Datastore,
+    [ValidateSet('Thin', 'Thick', 'EagerZeroedThick')][string]$DiskStorageFormat = 'Thin',
+    [string]$NetworkName,
+    [int]$CPU,
+    [decimal]$Memory,
+    [decimal]$DiskCapacity,
+    [int]$NicPosition = 1,
+    [ipaddress]$IP,
+    [ValidateRange(1, 32)][int]$SubnetLength = 24,
+    [ipaddress]$GW,
+    [ipaddress[]]$IP_DNS,
+    [string]$Domain,
+    [pscredential]$DomainCredential,
+    [pscredential]$VMLocalCredential,
+    [switch]$EnableRemoteDesktop,
+    [switch]$EnableFileSharing,
+    [ValidateRange(1, 86400)][int]$TimeoutSeconds = 900
+)
 
-### FUNCTION DEFINITIONS ################################################################################################
-function Import-PowerCLIModule {
-    foreach ($moduleName in "VCF.PowerCLI", "VMware.PowerCLI") {
-        if (Get-Module -ListAvailable -Name $moduleName) {
-            Import-Module $moduleName -ErrorAction Stop
-            return $moduleName
-        }
-    }
-
-    throw "Neither VCF.PowerCLI nor VMware.PowerCLI is installed."
+$ErrorActionPreference = 'Stop'
+if (!$Hostname -or !$Cluster -or !$VMTemplate -or !$CustomSpec -or !$Location -or !$Datastore -or !$NetworkName -or $CPU -lt 1 -or $Memory -le 0 -or $DiskCapacity -le 0 -or $NicPosition -lt 1) {
+    throw 'Supply the VM name, template, customization spec, cluster, folder, datastore, network, CPU, memory and disk capacity.'
 }
-
-function ConvertTo-EncodedGuestPowerShellCommand {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$ScriptText
-    )
-
-    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ScriptText))
+if ([bool]$Domain -ne [bool]$DomainCredential) { throw 'Supply -Domain and -DomainCredential together.' }
+if (($EnableRemoteDesktop -or $EnableFileSharing) -and !$VMLocalCredential) { throw 'Supply -VMLocalCredential for requested guest firewall changes.' }
+if ($IP -and (!$GW -or !$IP_DNS -or (@($IP, $GW) + $IP_DNS | Where-Object AddressFamily -NE InterNetwork))) { throw 'Static IPv4 requires an IPv4 address, gateway and DNS server addresses.' }
+if (!$IP -and ($GW -or $IP_DNS)) { throw 'Supply -IP for a static configuration.' }
+if ($vCenterCredential) {
+    if (!$Server -or [WildcardPattern]::ContainsWildcardCharacters($Server)) { throw 'Specify an exact -Server with -vCenterCredential.' }
+    $connection = Connect-VIServer -Server $Server -Credential $vCenterCredential -NotDefault -Force
+    $Server = $connection.Name
 }
-
-function New-WindowsPowerShellGuestCommand {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$ScriptText
-    )
-
-    $encodedCommand = ConvertTo-EncodedGuestPowerShellCommand -ScriptText $ScriptText
-    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
+if (-not $Server) {
+    $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+    $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+    if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+    $Server = $connections[0]
 }
-
-function Start-Customization([string]$VM) {
-    Write-Host "Verifying that customization for VM $VM has started"
-    $i = 60 # time-out of 5 min
-    while ($i -gt 0) {
-        $vmEvents = Get-VIEvent -Entity $VM
-        $startedEvent = $vmEvents | Where-Object {$_.GetType().Name -eq "CustomizationStartedEvent"}
-        if ($startedEvent) {
-            Write-Host "Customization for VM $VM has started"
-            return $true
-        }
-
-        Start-Sleep -Seconds 5
-        $i--
-    }
-
-    Write-Warning "Customization for VM $VM has failed"
-    return $false
+if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+function Get-SingleItem {
+    param([object[]]$Items, [string]$Description)
+    if ($Items.Count -ne 1 -or $null -eq $Items[0]) { throw "Expected one $Description. Found $($Items.Count)." }
+    $Items[0]
 }
-
-function Stop-Customizaton([string]$VM) {
-    Write-Host "Verifying that customization for VM $VM has finished"
-    $i = 60 # time-out of 5 min
-    while ($true) {
-        $vmEvents = Get-VIEvent -Entity $VM
-        $SucceededEvent = $vmEvents | Where-Object {$_.GetType().Name -eq "CustomizationSucceeded"}
-        $FailureEvent = $vmEvents | Where-Object {$_.GetType().Name -eq "CustomizationFailed"}
-        if ($FailureEvent -or ($i -eq 0)) {
-            Write-Warning "Customization of VM $VM failed"
-            return $false
-        }
-
-        if ($SucceededEvent) {
-            Write-Host "Customization of VM $VM completed successfully"
-            Start-Sleep -Seconds 30
-            Write-Host "Waiting for VM $VM to complete post-customization reboot"
-            Wait-Tools -VM $VM -TimeoutSeconds 300 | Out-Null
-            Start-Sleep -Seconds 30
-            return $true
-        }
-
-        Start-Sleep -Seconds 5
-        $i--
-    }
+function Assert-VMNameAvailable([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) { throw 'A VM name is required.' }
+    $filter = @{ Name = '(?i)^' + [regex]::Escape($Name) + '$' }
+    if (Get-View -Server $Server -ViewType VirtualMachine -Property Name -Filter $filter) { throw "A VM named '$Name' already exists on $Server." }
 }
-
-function Restart-VM([string]$VM) {
-    Restart-VMGuest -VM $VM -Confirm:$false | Out-Null
-    Write-Host "Reboot VM $VM"
-    Start-Sleep -Seconds 60
-    Wait-Tools -VM $VM -TimeoutSeconds 300 | Out-Null
-    Start-Sleep -Seconds 10
-}
-
-function Add-Script([string]$ScriptText, $Parameters=@(), [bool]$Reboot=$false, [string]$ScriptType="PowerShell") {
-    $i = 1
-    foreach ($parameter in $Parameters) {
-        if ($parameter -is [string]) {
-            $ScriptText = $ScriptText.Replace("%" + [string]$i, '"' + $parameter + '"')
-        } else {
-            $ScriptText = $ScriptText.Replace("%" + [string]$i, [string]$parameter)
-        }
-        $i++
-    }
-
-    $script:scripts += [pscustomobject]@{
-        ScriptText = $ScriptText
-        Reboot     = $Reboot
-        ScriptType = $ScriptType
-    }
-}
-
-function Test-IP([string]$IP) {
-    if (-not $IP -or ([bool]($IP -as [IPAddress]))) {
-        return $true
-    }
-
-    return $false
-}
-
-#### USER INTERACTIONS ##############################################################################################
-Clear-Host
-Write-Host "Deploy Windows server" -ForegroundColor Red
-$Hostname = Read-Host -Prompt "Hostname"
-if ($Hostname.Length -gt 15) {
-    Write-Host -ForegroundColor Red "$Hostname is an invalid hostname"
-    break
-}
-
-$IP = Read-Host -Prompt "IP Address (press ENTER for DHCP)"
-if (-not (Test-IP $IP)) {
-    Write-Host -ForegroundColor Red "$IP is an invalid address"
-    break
-}
-
-$JoinDomainYN = Read-Host "Join Domain $Domain (Y/N)"
-
-### READ CREDENTIALS ########################################################################################################
-$VMLocalCredential = Get-Credential -UserName "$Hostname\Administrator" -Message "Enter local Administrator credentials for the deployed VM"
-$vCenterCredential = Get-Credential -Message "Enter vCenter credentials"
-if ($JoinDomainYN.ToUpper() -eq "Y") {
-    $DomainCredential = Get-Credential -Message "Enter domain join credentials for $Domain"
-    $DomainAdmin = $DomainCredential.UserName
-    $DomainAdminPassword = $DomainCredential.GetNetworkCredential().Password
-}
-
-### CONNECT TO VCENTER ##############################################################################################
-Import-PowerCLIModule | Out-Null
-Connect-VIServer -Server $vCenterInstance -Credential $vCenterCredential -WarningAction SilentlyContinue
-$SourceVMTemplate = Get-Template -Name $VMTemplate
-$SourceCustomSpec = Get-OSCustomizationSpec -Name $CustomSpec
-
-### DEFINE POWERSHELL SCRIPTS TO RUN IN VM AFTER DEPLOYMENT ############################################################################################################
+Assert-VMNameAvailable $Hostname
+$clusterObject = Get-SingleItem @(Get-Cluster -Server $Server -Name ([WildcardPattern]::Escape($Cluster)) | Where-Object Name -EQ $Cluster) 'cluster'
+$template = Get-SingleItem @(Get-Template -Server $Server -Name ([WildcardPattern]::Escape($VMTemplate)) | Where-Object Name -EQ $VMTemplate) 'template'
+$store = Get-SingleItem @(Get-Datastore -Server $Server -Name ([WildcardPattern]::Escape($Datastore)) | Where-Object Name -EQ $Datastore) 'datastore'
+$folder = Get-SingleItem @(Get-Folder -Server $Server -Type VM -Name ([WildcardPattern]::Escape($Location)) | Where-Object Name -EQ $Location) 'VM folder'
+$sourceSpec = Get-SingleItem @(Get-OSCustomizationSpec -Server $Server -Name ([WildcardPattern]::Escape($CustomSpec)) | Where-Object Name -EQ $CustomSpec) 'customization specification'
+$spec = New-OSCustomizationSpec -Server $Server -OSCustomizationSpec $sourceSpec -Type NonPersistent
+$identity = @{ NamingScheme = 'Fixed'; NamingPrefix = $Hostname }
+if ($Domain) { $identity.Domain = $Domain; $identity.DomainCredentials = $DomainCredential }
+else { $identity.Workgroup = 'WORKGROUP' }
+$spec = Set-OSCustomizationSpec -OSCustomizationSpec $spec @identity -Confirm:$false
+$mapping = Get-SingleItem @($spec | Get-OSCustomizationNicMapping | Where-Object Position -EQ $NicPosition) 'customization NIC mapping'
+$nicSettings = @{ IpMode = 'UseDhcp' }
 if ($IP) {
-    Add-Script "New-NetIPAddress -InterfaceIndex 2 -IPAddress %1 -PrefixLength %2 -DefaultGateway %3" @($IP, $SubnetLength, $GW)
-    Add-Script "Set-DnsClientServerAddress -InterfaceIndex 2 -ServerAddresses %1" @($IP_DNS)
+    $mask = [uint32]::MaxValue -shl (32 - $SubnetLength)
+    $maskBytes = [BitConverter]::GetBytes([uint32]$mask)
+    if ([BitConverter]::IsLittleEndian) { [array]::Reverse($maskBytes) }
+    $nicSettings = @{ IpMode = 'UseStaticIP'; IpAddress = $IP.IPAddressToString; SubnetMask = ([ipaddress]::new($maskBytes)).IPAddressToString; DefaultGateway = $GW.IPAddressToString; Dns = $IP_DNS.IPAddressToString }
 }
-
-if ($JoinDomainYN.ToUpper() -eq "Y") {
-    $escapedDomainUser = ("$Domain\$DomainAdmin").Replace("'", "''")
-    $escapedDomainPassword = $DomainAdminPassword.Replace("'", "''")
-    $escapedDomainName = $Domain.Replace("'", "''")
-    $domainJoinScript = @'
-$DomainUser = %1
-$DomainPWord = ConvertTo-SecureString -String %2 -AsPlainText -Force
-$DomainCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $DomainUser, $DomainPWord
-Add-Computer -DomainName %3 -Credential $DomainCredential
-Restart-Computer -Force
-'@
-    $domainJoinScript = $domainJoinScript.Replace("%1", "'" + $escapedDomainUser + "'")
-    $domainJoinScript = $domainJoinScript.Replace("%2", "'" + $escapedDomainPassword + "'")
-    $domainJoinScript = $domainJoinScript.Replace("%3", "'" + $escapedDomainName + "'")
-    Add-Script (New-WindowsPowerShellGuestCommand -ScriptText $domainJoinScript) @() $true "Bat"
+$mapping | Set-OSCustomizationNicMapping @nicSettings -Confirm:$false | Out-Null
+$vm = New-VM -Server $Server -Name $Hostname -Template $template -ResourcePool $clusterObject -Location $folder -Datastore $store -DiskStorageFormat $DiskStorageFormat -OSCustomizationSpec $spec -ErrorAction Stop
+if (!$vm.Id) { throw 'Clone did not return a VM identity.' }
+$nics = @(Get-NetworkAdapter -VM $vm | Sort-Object { $_.ExtensionData.Key })
+if ($nics.Count -lt $NicPosition) { throw "The clone has no NIC at position $NicPosition." }
+Set-NetworkAdapter -NetworkAdapter $nics[$NicPosition - 1] -NetworkName $NetworkName -Confirm:$false | Out-Null
+Set-VM -VM $vm -NumCpu $CPU -MemoryGB $Memory -Confirm:$false | Out-Null
+$disk = Get-SingleItem @(Get-HardDisk -VM $vm | Where-Object Name -EQ 'Hard disk 1') 'system VMDK'
+if ($disk.CapacityGB -gt $DiskCapacity) { throw 'Requested system disk size would shrink the cloned disk.' }
+if ($disk.CapacityGB -lt $DiskCapacity) { Set-HardDisk -HardDisk $disk -CapacityGB $DiskCapacity -Confirm:$false | Out-Null }
+$start = Get-Date
+Start-VM -VM $vm -Confirm:$false | Out-Null
+$deadline = $start.AddSeconds($TimeoutSeconds)
+do {
+    $events = @(Get-VIEvent -Server $Server -Entity $vm -Start $start)
+    if ($events | Where-Object { $_ -is [VMware.Vim.CustomizationFailed] }) { throw "Guest customization failed on $Hostname." }
+    if ($events | Where-Object { $_ -is [VMware.Vim.CustomizationSucceeded] }) { break }
+    if ((Get-Date) -ge $deadline) { throw "Timed out waiting for customization on $Hostname." }
+    Start-Sleep -Seconds 5
+} while ($true)
+if ($EnableRemoteDesktop -or $EnableFileSharing) {
+    $ready = Wait-Tools -VM $vm -TimeoutSeconds $TimeoutSeconds
+    if (!$ready) { throw "VMware Tools did not become ready on $Hostname." }
+    $steps = @(
+        '$ErrorActionPreference = "Stop"'
+        if ($EnableRemoteDesktop) {
+            'Set-ItemProperty -LiteralPath "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1'
+            'Set-ItemProperty -LiteralPath "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0'
+            'Enable-NetFirewallRule -DisplayGroup "Remote Desktop"'
+        }
+        if ($EnableFileSharing) { 'Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"' }
+    )
+    $result = Invoke-VMScript -VM $vm -GuestCredential $VMLocalCredential -ScriptType Powershell -ScriptText ($steps -join [Environment]::NewLine)
+    if ($result.ExitCode -ne 0) { throw "Guest configuration failed on $Hostname. $($result.ScriptOutput)" }
 }
-
-Add-Script 'Import-Module NetSecurity; Set-NetFirewallRule -DisplayGroup "File and Printer Sharing" -Enabled True'
-Add-Script 'Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0;
-            Enable-NetFirewallRule -DisplayGroup "Remote Desktop";
-            Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0'
-
-### DEPLOY VM ###############################################################################################################################################################
-Write-Host "Deploying virtual machine with name: [$Hostname] using template: [$SourceVMTemplate] and customization specification: [$SourceCustomSpec] on cluster: [$Cluster]"
-New-VM -Name $Hostname -Template $SourceVMTemplate -ResourcePool $Cluster -OSCustomizationSpec $SourceCustomSpec -Location $Location -Datastore $DataStore -DiskStorageFormat $DiskStorageFormat | Out-Null
-Get-VM $Hostname | Get-NetworkAdapter | Set-NetworkAdapter -Portgroup $NetworkName -Confirm:$false | Out-Null
-Set-VM -VM $Hostname -NumCpu $CPU -MemoryGB $Memory -Confirm:$false | Out-Null
-Get-VM $Hostname | Get-HardDisk | Where-Object {$_.Name -eq "Hard Disk 1"} | Set-HardDisk -CapacityGB $DiskCapacity -Confirm:$false | Out-Null
-Write-Host "Virtual machine $Hostname deployed. Powering on"
-Start-VM -VM $Hostname | Out-Null
-if (-not (Start-Customization $Hostname)) { break }
-if (-not (Stop-Customizaton $Hostname)) { break }
-
-foreach ($script in $scripts) {
-    Invoke-VMScript -ScriptText $script.ScriptText -ScriptType $script.ScriptType -VM $Hostname -GuestCredential $VMLocalCredential | Out-Null
-    if ($script.Reboot) {
-        Restart-VM $Hostname
-    }
-}
-
-### End of Script ##############################
-Write-Host "Deployment of VM $Hostname finished"
+$vm

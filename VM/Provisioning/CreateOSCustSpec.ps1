@@ -1,6 +1,25 @@
-$DomainCred  = Get-Credential -Message "Enter domain join credentials for the customization spec"
-$DomainUser  = $DomainCred.UserName
-$DomainPass  = $DomainCred.GetNetworkCredential().Password
+[CmdletBinding()]
+param(
+    [string]$Server,
+    [string]$Name = 'Win2022Spec',
+    [string]$Domain,
+    [pscredential]$DomainCredential,
+    [securestring]$AdminPassword,
+    [string]$Organization = 'Organization Name',
+    [string]$ProductKey
+)
 
-New-OSCustomizationSpec -Name "Win2022Spec" -FullName "Administrator" -OrgName "Organization Name" -Domain "domain.com" -DomainUsername $DomainUser -DomainPassword $DomainPass -Server VIServer -OSType Windows -TimeZone "Pacific Standard Time" -Type Persistent -ProductKey MSProductKey -NamingScheme Prefix -NamingPrefix ORG-LOC-WIN-
-New-OSCustomizationNicMapping -OSCustomizationSpec "Win2022Spec" -IpMode UseStaticIP -IpAddress "10.10.10.100" -SubnetMask "255.255.255.0" -DefaultGateway "10.10.10.1" -AlternateGateway "10.10.10.2" -Dns "10.10.10.10" -Position 1
+$ErrorActionPreference = 'Stop'
+if (!$Domain -or !$DomainCredential -or !$AdminPassword) { throw 'Supply -Domain, -DomainCredential and -AdminPassword.' }
+if (-not $Server) {
+    $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+    $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+    if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+    $Server = $connections[0]
+}
+if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+$options = @{ Server = $Server; Name = $Name; FullName = 'Administrator'; OrgName = $Organization; Domain = $Domain; DomainCredentials = $DomainCredential; OSType = 'Windows'; TimeZone = '004'; Type = 'Persistent'; NamingScheme = 'Vm'; AdminPassword = ([pscredential]::new('Administrator', $AdminPassword).GetNetworkCredential().Password) }
+if ($ProductKey) { $options.ProductKey = $ProductKey }
+# New-OSCustomizationSpec creates its first NIC mapping with DHCP.
+New-OSCustomizationSpec @options -Confirm:$false
