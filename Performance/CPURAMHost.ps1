@@ -1,17 +1,14 @@
-$AllHosts = @()
-Get-VMHost * | ForEach-Object {
-    $hoststat = "" | Select-Object HostName, MemMax, MemAvg, MemMin, CPUMax, CPUAvg, CPUMin
-    $hoststat.HostName = $_.Name
-    $statcpu = Get-Stat -Entity $_ -Start (Get-Date).AddDays(-30) -Finish (Get-Date)-MaxSamples 1000 -Stat cpu.usage.average
-    $statmem = Get-Stat -Entity $_ -Start (Get-Date).AddDays(-30) -Finish (Get-Date)-MaxSamples 1000 -Stat mem.usage.average
-    $cpu = $statcpu | Measure-Object -Property value -Average -Maximum -Minimum
-    $mem = $statmem | Measure-Object -Property value -Average -Maximum -Minimum
-    $hoststat.CPUMax = [math]::Round($cpu.Maximum)
-    $hoststat.CPUAvg = [math]::Round($cpu.Average)
-    $hoststat.CPUMin = [math]::Round($cpu.Minimum)
-    $hoststat.MemMax = [math]::Round($mem.Maximum)
-    $hoststat.MemAvg = [math]::Round($mem.Average)
-    $hoststat.MemMin = [math]::Round($mem.Minimum)
-    $AllHosts += $hoststat
-}
-$AllHosts | Select-Object HostName, MemMax, MemAvg, MemMin, CPUMax, CPUAvg, CPUMin | Export-Csv .\CPURAMPerfHosts.csv -NoTypeInformation
+$finish = Get-Date
+$start = $finish.AddDays(-30)
+Get-VMHost -ErrorAction Stop | ForEach-Object {
+    $row = [ordered]@{ HostName = $_.Name }
+    foreach ($metric in 'cpu', 'mem') {
+        $samples = @(Get-Stat -Entity $_ -Start $start -Finish $finish -MaxSamples 1000 -Stat "$metric.usage.average" | Where-Object { $null -ne $_.Value -and -not $_.Instance })
+        $stats = $samples | Measure-Object -Property Value -Maximum -Average -Minimum
+        $prefix = if ($metric -eq 'cpu') { 'CPU' } else { 'Mem' }
+        foreach ($stat in 'Maximum', 'Average', 'Minimum') {
+            $row[$prefix + $stat.Substring(0, 3).Replace('Ave', 'Avg')] = if ($samples.Count) { [math]::Round($stats.$stat) }
+        }
+    }
+    [pscustomobject]$row
+} | Export-Csv ./CPURAMPerfHosts.csv
