@@ -1,4 +1,1 @@
-$VMs = Get-VM
-foreach ($VM in $VMs) {
-    $VM | Select-Object Name, HardwareVersion | Export-Csv -Path .\VMHardwareVersion.csv -NoTypeInformation -Append
-}
+Get-VM -ErrorAction Stop | Select-Object Name, HardwareVersion | Export-Csv ./VMHardwareVersion.csv

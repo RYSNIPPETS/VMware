@@ -1,28 +1,17 @@
-﻿$FinalResult = @()
-$VMs = Get-View -ViewType "VirtualMachine" #-Filter @{"Runtime.PowerState"="PoweredOn"}
-foreach ($VM in $VMs){
-    $totalCapacity = $totalFree = 0
-    $vm.Guest.Disk | ForEach-Object{
-        $object = New-Object -TypeName PSObject
-        $Capacity = "{0:N0}" -f [math]::Round($_.Capacity/1GB)
-        $totalCapacity += $_.Capacity
-        $totalFree += $_.FreeSpace
-        $Freespace = "{0:N0}" -f [math]::Round($_.FreeSpace/1GB)
-        $PercentageFree = [math]::Round(($FreeSpace)/($Capacity)*100)
-        $PercentFree = "{0:P0}" -f ($PercentageFree/100)
-        $object | Add-Member -MemberType NoteProperty -Name "VM" -Value $vm.Name
-        $object | Add-Member -MemberType NoteProperty -Name Disk -Value $_.DiskPath
-        $object | Add-Member -MemberType NoteProperty -Name "TotalCapacity" -Value $Capacity
-        $object | Add-Member -MemberType NoteProperty -Name "FreeSpace" -Value $FreeSpace
-        $object | Add-Member -MemberType NoteProperty -Name "PercentFree" -Value $PercentFree
-        $finalResult += $object
+function New-DiskReportRow($vmName, $diskName, $capacity, $free) {
+    [pscustomobject]@{
+        VM            =$vmName
+        Disk          =$diskName
+        TotalCapacity =if ($null -ne $capacity) { [math]::Round($capacity / 1GB, 3) }
+        FreeSpace     =if ($null -ne $free) { [math]::Round($free / 1GB, 3) }
+        PercentFree   =if ($capacity -gt 0 -and $null -ne $free) { '{0:P0}' -f ($free / $capacity) }
     }
-    $object = New-Object -TypeName PSObject
-    $object | Add-Member -MemberType NoteProperty -Name "VM" -Value $vm.Name
-    $object | Add-Member -MemberType NoteProperty -Name Disk -Value 'SubTotal'
-    $object | Add-Member -MemberType NoteProperty -Name "TotalCapacity" -Value ("{0:N0}" -f ($totalCapacity/1GB))
-    $object | Add-Member -MemberType NoteProperty -Name "FreeSpace" -Value ("{0:N0}" -f ($totalFree/1GB))
-    $object | Add-Member -MemberType NoteProperty -Name "PercentFree" -Value ("{0:P0}" -f ($totalFree/$totalCapacity))
-    $finalResult += $object
 }
-$finalResult | Export-Csv .\DiskUsageReport.csv -NoTypeInformation -UseCulture
+Get-View -ViewType VirtualMachine -Property Name, Guest.Disk -ErrorAction Stop | ForEach-Object {
+    $vm = $_
+    $disks = @($vm.Guest.Disk | Where-Object { $_ })
+    foreach ($disk in $disks) { New-DiskReportRow -VMName $vm.Name -DiskName $disk.DiskPath -Capacity $disk.Capacity -Free $disk.FreeSpace }
+    $capacity = if ($disks.Count -and !($disks | Where-Object { $null -eq $_.Capacity })) { ($disks | Measure-Object Capacity -Sum).Sum }
+    $free = if ($disks.Count -and !($disks | Where-Object { $null -eq $_.FreeSpace })) { ($disks | Measure-Object FreeSpace -Sum).Sum }
+    New-DiskReportRow -VMName $vm.Name -DiskName SubTotal -Capacity $capacity -Free $free
+} | Export-Csv ./DiskUsageReport.csv -UseCulture
