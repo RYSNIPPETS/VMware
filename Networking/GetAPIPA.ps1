@@ -1,5 +1,5 @@
-### Export VMs that have APIPA Addresses to CSV ###
-Get-View -ViewType VirtualMachine `
-         -Property Name, Guest. IPAddress `
-         -Filter @{"Guest.IpAddress"="169.254.*"} | Select-Object Name, @{N="IP";E={@($_.Guest.IPAddress)}} `
-| Export-Csv .\APIPAIPAddresses.csv -NoTypeInformation
+Get-View -ViewType VirtualMachine -Property Name, Guest.Net, Guest.IpAddress -ErrorAction Stop | ForEach-Object {
+    $addresses = @($_.Guest.IpAddress) + @($_.Guest.Net | ForEach-Object { $_.IpAddress })
+    $linkLocal = @($addresses | Where-Object { $_ -match '^169\.254\.(?:\d{1,3}\.)\d{1,3}$' } | Sort-Object -Unique)
+    if ($linkLocal.Count) { [pscustomobject]@{ Name = $_.Name; IP = $linkLocal -join '; ' } }
+} | Export-Csv ./APIPAIPAddresses.csv

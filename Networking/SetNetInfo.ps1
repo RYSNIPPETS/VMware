@@ -1,46 +1,54 @@
-###############VARIABLES###############
-#Original IP to replace"
-$origIp = "10.67.133.223"
-#New IP Information
-$newIp = "10.10.10.10"
-$newMask = "255.255.255.0"
-$newGateway = "10.10.10.1"
-$newDNS = "10.10.10.9"
-#Guest Credentials - Must have required permissions to change IP address
-$GuestCred = Get-Credential -Message "Enter guest VM credentials (must have permission to change IP)"
-#VM Inventory names to match
-$matchVMs = "NameofVM"
-##############NO CHANGES BEYOND THIS POINT##############
-#List of VMs (vCenter Inventory Names) to change
-Write-Host "Getting list of VMs from Inventory where Inventory Name contains $matchVMs"
-$VMs = (get-vm | Where-Object {$_.Name -match $matchVMs -and $_.PowerState -eq "PoweredOn"}).Name
-foreach ($vm in $VMs){
-   Write-Host "Working on $vm"
-   #PowerShell used by Invoke-VMScript to retrieve current IP Address
-   $ipscript = '(Get-NetIPAddress | where-object {$_.IPAddress -match "' + $origIp + '" -and $_.AddressFamily -eq "IPv4"}).IPAddress'
-   $currentIp = invoke-vmscript -ScriptText $ipscript -ScriptType PowerShell -VM $vm -GuestCredential $GuestCred
-   $currentIp = $currentIp -replace "`t|`n|`r",""
-   write-host "$currentIp is the current IP Address"
-   #Adjust Original IP to Replacement IP
-   $changeIp = $currentIp.replace("$origIp", "$newIp")
-   $changeIp = $changeIp -replace "`t|`n|`r",""
-   Write-Host "Changing IP to $changeIp"
-   #Get the Interface Name (Alias)
-   $aliasscript = '(Get-NetIPAddress | where-object {$_.IPAddress -match "' + $origIp + '" -and $_.AddressFamily -eq "IPv4"}).InterfaceAlias'
-   $getIntAlias = invoke-vmscript -ScriptText $aliasscript -ScriptType PowerShell -VM $vm -GuestCredential $GuestCred
-   $getIntAlias = $getIntAlias -replace "`t|`n|`r",""
-   write-host "The interface name is $getIntAlias"
-   #Change the IP Address
-   $changingIp = '%WINDIR%\system32\netsh.exe interface ipv4 set address name="' + $getIntAlias + '" source=static address=' + $changeIp + ' mask=' + $newMask + ' gateway=' + $newGateway + ' gwmetric=1 store=persistent'
-   Write-host "Changing IP Address of $vm interface $getIntAlias from $currentIp to $changeIp"
-   Invoke-VMScript -ScriptText $changingIp -ScriptType bat -VM $vm -GuestCredential $GuestCred
-   #Change DNS Servers
-   Write-Host "Setting DNS Server to $newDNS"
-   $changeDNS = '%WINDIR%\system32\netsh.exe interface ipv4 set dnsservers name="' + $getIntAlias + '" source=static address=' + $newDNS + ' register=primary'
-   Invoke-VMScript -ScriptText $changeDNS -ScriptType bat -VM $vm -GuestCredential $GuestCred
-   #Register with DNS
-   Write-Host "Registering with DNS"
-   $registeringDNS = '%WINDIR%\System32\ipconfig /registerdns'
-   Invoke-VMScript -ScriptText $registeringDNS -ScriptType bat -VM $vm -GuestCredential $GuestCred
-   Write-Host "Finished with $vm"
+[CmdletBinding()]
+param(
+    [string]$Server,
+    [string]$VMName,
+    [pscredential]$GuestCredential,
+    [ipaddress]$OriginalIP,
+    [ipaddress]$NewIP,
+    [ipaddress]$SubnetMask,
+    [ipaddress]$Gateway,
+    [ipaddress]$DnsServer
+)
+
+$ErrorActionPreference = 'Stop'
+if (!$VMName -or !$GuestCredential) { throw 'Supply -VMName and -GuestCredential.' }
+foreach ($address in @($OriginalIP, $NewIP, $SubnetMask, $Gateway, $DnsServer)) {
+    if ($address.AddressFamily -ne 'InterNetwork') { throw 'Supply an IPv4 address for each network setting.' }
 }
+if (-not $Server) {
+    $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+    $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+    if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+    $Server = $connections[0]
+}
+if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+function Get-ExactVM {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { throw 'A VM name is required.' }
+    $matchesFound = @(Get-VM -Server $Server -Name ([WildcardPattern]::Escape($Name)) | Where-Object Name -EQ $Name)
+    if ($matchesFound.Count -ne 1) { throw "Expected one VM named '$Name' on '$Server'. Found $($matchesFound.Count)." }
+    $matchesFound[0]
+}
+function ConvertTo-GuestData {
+    param($Value)
+    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Value -Compress -Depth 5)))
+}
+$vm = Get-ExactVM $VMName
+$data = ConvertTo-GuestData @{ Old = $OriginalIP.IPAddressToString; New = $NewIP.IPAddressToString; Mask = $SubnetMask.IPAddressToString; Gateway = $Gateway.IPAddressToString; Dns = $DnsServer.IPAddressToString }
+$scriptText = @'
+$ErrorActionPreference = 'Stop'
+$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('DATA')) | ConvertFrom-Json
+$addresses = @(Get-NetIPAddress -AddressFamily IPv4)
+$current = @($addresses | Where-Object IPAddress -eq $config.Old)
+if ($current.Count -ne 1) { throw 'Expected exactly one interface with the original address.' }
+if ($config.Old -ne $config.New -and $addresses.IPAddress -contains $config.New) { throw 'Replacement address is already present.' }
+$index = $current[0].InterfaceIndex
+netsh.exe interface ipv4 set address "name=$index" source=static "address=$($config.New)" "mask=$($config.Mask)" "gateway=$($config.Gateway)" store=persistent
+if ($LASTEXITCODE -ne 0) { throw "Address change failed ($LASTEXITCODE)." }
+if (!(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 | Where-Object IPAddress -eq $config.New)) { throw 'New address was not applied.' }
+Set-DnsClientServerAddress -InterfaceIndex $index -ServerAddresses $config.Dns
+Register-DnsClient
+'@
+$result = Invoke-VMScript -VM $vm -GuestCredential $GuestCredential -ScriptType Powershell -ScriptText $scriptText.Replace('DATA', $data)
+if ($result.ExitCode -ne 0) { throw "Network update failed on $VMName. $($result.ScriptOutput)" }
