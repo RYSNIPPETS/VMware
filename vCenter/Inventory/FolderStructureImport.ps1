@@ -1,31 +1,84 @@
+[CmdletBinding()]
+param(
+    $Server,
+    [string]$DC,
+    [string]$Filename = './VMLocation.csv'
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Get-SingleItem {
+    param([object[]]$Items, [string]$Description)
+    if ($Items.Count -ne 1 -or $null -eq $Items[0]) { throw "Expected one $Description. Found $($Items.Count)." }
+    $Items[0]
+}
+
+function Get-InventoryRoot {
+    param($Server, [string]$DC, [string]$Kind)
+    if (!$DC) { throw 'Supply an exact datacenter name.' }
+    $location = Get-SingleItem @(Get-Datacenter -Server $Server | Where-Object Name -CEQ $DC) 'matching datacenter'
+    $ref = if ($Kind -eq 'Yellow') { $location.ExtensionData.HostFolder } else { $location.ExtensionData.VmFolder }
+    Get-SingleItem @(Get-Folder -Id "Folder-$($ref.Value)" -Server $Server) 'inventory root folder'
+}
+function Get-ChildFolder {
+    param($Parent, $Server)
+    Get-Folder -Location $Parent -NoRecursion -Server $Server | Where-Object { $_.ExtensionData.Parent.Value -eq $Parent.ExtensionData.MoRef.Value }
+}
+function Resolve-FolderPath {
+    param($Root, [string[]]$Parts, $Server)
+    $parent = $Root
+    foreach ($part in $Parts) {
+        if ([string]::IsNullOrEmpty($part)) { throw 'Empty folder name in path.' }
+        $found = @(Get-ChildFolder $parent $Server | Where-Object Name -CEQ $part)
+        $parent = Get-SingleItem $found "child folder '$part' under '$($parent.Name)'"
+    }
+    $parent
+}
+function Get-RowPath {
+    param($Row, $Root, [string]$DC, [switch]$VM)
+    if ($Row.PathParts) {
+        if ($Row.Root -cne $Root.Name -or $Row.Datacenter -cne $DC) { throw 'Folder root or datacenter differs from export.' }
+        $parts = ConvertFrom-Json -InputObject $Row.PathParts -NoEnumerate
+        if ($parts -isnot [array]) { throw 'Invalid folder path array.' }
+        foreach ($part in $parts) {
+            if ($part -isnot [string] -or !$part) { throw 'Invalid folder name.' }
+            $part
+        }
+        return
+    }
+    $legacy = @($Row.Path -split '\\')
+    if ($legacy[0] -ceq $DC) { $legacy = @($legacy | Select-Object -Skip 1) }
+    elseif ($legacy[0] -cne $Root.Name) { throw 'Legacy path lacks a matching inventory root.' }
+    if ($legacy[0] -ceq $Root.Name) { $legacy = @($legacy | Select-Object -Skip 1) }
+    if (!$legacy -or $legacy[-1] -cne $Row.Name) { throw 'Legacy path and row name disagree.' }
+    if ($VM) { $legacy | Select-Object -SkipLast 1 } else { $legacy }
+}
 function Import-VMLocation {
-<#
-.SYNOPSIS
-Imports the VMs back into their Blue Folders based on the data from a csv file.
-.DESCRIPTION
-The function will import VM locations from CSV File and add them to their correct Blue Folders.
-.NOTES
-Source:  Automating vSphere Administration
-.PARAMETER DC
-The Datacenter where the folders reside
-.PARAMETER Filename
-The path of the CSV file to use when importing
-.EXAMPLE
-​Import-VMLocation -DC "DC01" -Filename "C:\VMLocations.csv"
-#>
-    param(
-        [String]$DC,
-        [String]$Filename
-    )
-    Process {
-        $Report = @()
-        $Report = Import-Csv $filename | Sort-Object -Property Path
-        foreach($vmpath in $Report){
-            $key = @()
-            $key = Split-Path $vmpath.Path | Split-Path -Leaf
-            Move-VM (Get-Datacenter $dc | Get-VM $vmpath.Name) -Destination (Get-Datacenter $dc | Get-Folder $key)
+    param([string]$DC, [string]$Filename, $Server)
+    if (-not $Server) {
+        $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+        $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+        if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+        $Server = $connections[0]
+    }
+    if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+
+    $root = Get-InventoryRoot -Server $Server -DC $DC -Kind Blue
+    $instance = $root.ExtensionData.Client.ServiceContent.About.InstanceUuid
+    $inventory = @(Get-VM -Location $root -Server $Server)
+    foreach ($row in (Import-Csv -LiteralPath $Filename)) {
+        $parts = @(Get-RowPath -Row $row -Root $root -DC $DC -VM)
+        $destination = Resolve-FolderPath -Root $root -Parts $parts -Server $Server
+        $candidates = @($inventory | Where-Object Name -CEQ $row.Name)
+        if ($row.VMId -or $row.ServerInstanceUuid) {
+            if (!$instance -or $row.ServerInstanceUuid -ne $instance) { throw 'VM export belongs to a different vCenter.' }
+            $candidates = @($candidates | Where-Object Id -EQ $row.VMId)
+        }
+        $vm = Get-SingleItem $candidates "VM '$($row.Name)' in datacenter '$DC'"
+        if ($vm.ExtensionData.Parent.Value -ne $destination.ExtensionData.MoRef.Value) {
+            Move-VM -VM $vm -InventoryLocation $destination -Server $Server -Confirm:$false
         }
     }
 }
-
-Import-VMLocation "DC01" "C:\VMLocation.csv"
+if ($MyInvocation.InvocationName -ne '.') { Import-VMLocation -DC $DC -Filename $Filename -Server $Server }

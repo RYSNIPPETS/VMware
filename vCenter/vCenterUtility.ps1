@@ -1,15 +1,34 @@
-﻿<# DOMAIN MIGRATION UTILITY - VERSION 1.4 #>
-using namespace System.Management.Automation.Host
+<#
+.SYNOPSIS
+Runs one of the domain migration utility actions on the selected vCenter.
+.EXAMPLE
+./vCenterUtility.ps1 -Action 91a -Server vc.example.org -VMName web01
+.EXAMPLE
+./vCenterUtility.ps1 -Action 11b -Server vc.example.org -VMListPath ./VMList.txt -GuestCredential $localAdmin
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('1', '2', '3', '4', '11a', '11b', '12a', '12b', '13a', '21a', '21b', '22a', '22b', '23a', '23b', '24a', '24b', '25a', '25b', '31a', '31b', '32a', '32b', '41a', '41b', '42a', '42b', '43a', '43b', '44a', '44b', '44c', '51a', '51b', '52a', '52b', '61a', '61b', '62a', '62b', '64a', '64b', '65a', '65b', '71a', '71b', '72a', '72b', '81a', '81b', '91a', '91b', '92a', '92b', '101a', '101b', '102a', '103a', '104a', '105a', '111a', '111b', '112a', '112b', '121a', '121b', '122a', '122b', '48a', '48b', 'help', 'q')][string]$Action = 'help',
+    $Server,
+    [string]$VMName,
+    [string]$VMListPath = (Join-Path $PSScriptRoot 'VMList.txt'),
+    [Alias("GuestCreds")][pscredential]$GuestCredential,
+    [Alias("ADMTCreds")][pscredential]$DomainCredential,
+    [pscredential]$vCenterCredential,
+    [ValidatePattern('^[a-zA-Z0-9.-]+$')][string]$Domain,
+    [ValidatePattern('^[a-zA-Z0-9.-]+$')][string]$DC,
+    [ipaddress]$DCIP,
+    [ipaddress]$PrimaryDnsServer,
+    [ipaddress]$SecondaryDnsServer,
+    [string]$ServiceAccountMatch
+)
 
-<# GENERAL VARIABLES #>
-$VMListPath = Join-Path -Path $PSScriptRoot -ChildPath 'VMList.txt'
-$VMs = Get-Content -Path $VMListPath
-$Domain = 'domain.com'
-$DC = 'COMPUTERNAME'
-$DCIP = '10.10.10.30'
-$PrimaryDnsServer = '10.10.10.1'
-$SecondaryDnsServer = '10.10.10.2'
-$ServiceAccountMatch = 'svc startname'
+$ErrorActionPreference = 'Stop'
+
+$GuestCreds = $GuestCredential
+$ADMTCreds = $DomainCredential
+$accountData = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$DomainCredential.UserName))
+$serviceData = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$ServiceAccountMatch))
 $PingDC = "ping $DC.$Domain"
 $PingDCIP = "ping $DCIP"
 $UsersInGroup = @'
@@ -109,7 +128,7 @@ $services |
     Format-Table -AutoSize | Out-String
 '@
 $GetDomainSvc = @"
-`$serviceAccountMatch = '$ServiceAccountMatch'
+`$serviceAccountMatch = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$serviceData'))
 `$services = if (Get-Command -Name Get-CimInstance -ErrorAction SilentlyContinue) {
     Get-CimInstance -ClassName Win32_Service
 }
@@ -170,14 +189,14 @@ function Test-GuestTcpPort {
 }
 
 `$target = '$DCIP'
-[ordered]@{
+([ordered]@{
     DNS      = 53
     Kerberos = 88
     RPC      = 135
     LDAP     = 389
     SMB      = 445
     GC       = 3268
-}.GetEnumerator() |
+}).GetEnumerator() |
     ForEach-Object {
         [pscustomobject]@{
             Target   = `$target
@@ -188,21 +207,8 @@ function Test-GuestTcpPort {
     } |
     Format-Table -AutoSize | Out-String
 "@
-# $ManualMoveScript is built after ADMT credentials are collected below
-
-
-<# DOMAIN LOGIN VARIABLES #>
-Write-Host "Let's get started! Please enter your Domain credentials." -ForegroundColor Magenta -BackgroundColor Black
-$GuestUser = Read-Host "Enter your Domain UserName (Domain\UserName): "
-$GuestPasswordSec = Read-Host "Enter your Domain Password: " -AsSecureString
-$GuestCreds = New-Object System.Management.Automation.PSCredential ($GuestUser, $GuestPasswordSec)
-<# ADMT LOGIN VARIABLES #>
-Write-Host "Now let's get your ADMT credentials." -ForegroundColor Magenta -BackgroundColor Black
-$ADMTAccount = Read-Host "Enter your ADMT account UserName (Domain\UserName): "
-$ADMTPasswordSec = Read-Host "Enter your ADMT account Password: " -AsSecureString
-$ADMTCreds = New-Object System.Management.Automation.PSCredential ($ADMTAccount, $ADMTPasswordSec)
 $Add2GroupCD = @"
-`$memberName = '$ADMTAccount'
+`$memberName = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$accountData'))
 if (Get-Command -Name Add-LocalGroupMember -ErrorAction SilentlyContinue) {
     `$memberExists = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue |
         Where-Object { `$_.Name -eq `$memberName }
@@ -215,153 +221,167 @@ else {
 }
 "`$memberName is a member of the local Administrators group."
 "@
-$ManualMoveScript = @"
-`$DomainUser = '$ADMTAccount'
-`$DomainPWord = ConvertTo-SecureString -String '$($ADMTCreds.GetNetworkCredential().Password)' -AsPlainText -Force
-`$DomainCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList `$DomainUser, `$DomainPWord
-Add-Computer -DomainName '$Domain' -Credential `$DomainCredential
-Start-Sleep -Seconds 20
-Shutdown /r /t 0
-"@
-<# VCENTER LOGIN VARIABLES #>
-Write-Host "Last step! Enter your vCenter password." -ForegroundColor Magenta -BackgroundColor Black
-$vCenter = "10.10.10.20"
-$vCenterUser = Read-Host "Enter your vCenter UserName (Domain\UserName): "
-$vCenterPasswordSec = Read-Host "Enter your vCenter Password: " -AsSecureString
-$vCenterCreds = New-Object System.Management.Automation.PSCredential ($vCenterUser, $vCenterPasswordSec)
+function Join-GuestDomain {
+    param($VM, [string]$Domain, [pscredential]$GuestCredential, [pscredential]$DomainCredential)
+    $guestName = $VM.ExtensionData.Guest.HostName
+    $uuid = $VM.ExtensionData.Config.Uuid
+    if (!$guestName -or !$uuid) { throw "Missing guest DNS name or BIOS UUID for $($VM.Name)." }
+    $joinScript = {
+        param([string]$Domain, [pscredential]$JoinCredential, [guid]$Uuid)
+        $ErrorActionPreference = 'Stop'
+        $actual = [guid](Get-CimInstance Win32_ComputerSystemProduct).UUID
+        $raw = $Uuid.ToString('N')
+        $bytes = for ($i = 0; $i -lt 32; $i += 2) { [Convert]::ToByte($raw.Substring($i, 2), 16) }
+        if ($actual -ne $Uuid -and $actual -ne [guid]::new([byte[]]$bytes)) { throw 'Guest BIOS UUID does not match the selected VM.' }
+        $computer = Get-CimInstance Win32_ComputerSystem
+        if ($computer.PartOfDomain -and $computer.Domain -eq $Domain) { return }
+        $joined = Add-Computer -DomainName $Domain -Credential $JoinCredential -Force -PassThru -ErrorAction Stop
+        if (!$joined.HasSucceeded) { throw 'Domain join failed.' }
+        shutdown.exe /r /t 10
+        if ($LASTEXITCODE -ne 0) { throw "Joined domain but could not schedule reboot ($LASTEXITCODE)." }
+    }
+    Invoke-Command -ComputerName $guestName -UseSSL -ConfigurationName Microsoft.PowerShell -Credential $GuestCredential -ArgumentList $Domain, $DomainCredential, $uuid -ErrorAction Stop -ScriptBlock $joinScript
+}
 
+function Get-ExactVM {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { throw 'A VM name is required.' }
+    $matchesFound = @(Get-VM -Server $Server -Name ([WildcardPattern]::Escape($Name)) | Where-Object Name -EQ $Name)
+    if ($matchesFound.Count -ne 1) { throw "Expected one VM named '$Name' on '$Server'. Found $($matchesFound.Count)." }
+    $matchesFound[0]
+}
 
-<# FUNCTIONS #>
+function Invoke-CheckedGuestScript {
+    param($VM, [pscredential]$GuestCredential, [string]$ScriptType, [string]$ScriptText)
+    if (!$GuestCredential) { throw 'Supply -GuestCredential for this guest operation.' }
+    $prefix = '$ErrorActionPreference = "Stop"; $LASTEXITCODE = 0' + [Environment]::NewLine
+    $suffix = [Environment]::NewLine + 'if ($LASTEXITCODE) { exit $LASTEXITCODE }'
+    $result = Invoke-VMScript -VM $VM -GuestCredential $GuestCredential -ScriptType $ScriptType -ScriptText ($prefix + $ScriptText + $suffix) -ErrorAction Stop
+    if ($null -eq $result.ExitCode -or $result.ExitCode -ne 0) { throw "Guest operation failed on $($VM.Name): $($result.ScriptOutput)" }
+    $result
+}
+
+function Update-EligibleVMTool($Target) {
+    $guest = $Target.ExtensionData.Guest
+    if ($Target.PowerState -eq 'PoweredOn' -and $guest.ToolsRunningStatus -eq 'guestToolsRunning' -and
+        $guest.ToolsVersionStatus2 -in 'guestToolsNeedUpgrade', 'guestToolsSupportedOld', 'guestToolsTooOld', 'guestToolsBlacklisted') {
+        Update-Tools -VM $Target -NoReboot
+    }
+}
+
 function Show-Menu {
     param (
         [string]$Title = 'Domain Migration Utility v1.4'
     )
-    Clear-Host
-    Write-Host "================ $Title ================"
+    Write-Output "================ $Title ================"
 
-    Write-Host "VCENTER AND VM LIST" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "1: Press '1' to connect to vCenter." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "2: Press '2' to disconnect from vCenter." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "3: Press '3' to show VMs in list." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "4: Press '4' to see if VMs are in vCenter." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "VCENTER AND VM LIST"
+    Write-Output "1: connect to vCenter."
+    Write-Output "2: disconnect from vCenter."
+    Write-Output "3: show VMs in list."
+    Write-Output "4: see if VMs are in vCenter."
 
-    Write-Host "VMWARE TOOLS STATUS" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "91a: Press '91a' to check VMware Tools on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "91b: Press '91b' to check VMware Tools on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "92a: Press '92a' to update VMware Tools on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "92b: Press '92b' to update VMware Tools on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "VMWARE TOOLS STATUS"
+    Write-Output "91a: check VMware Tools on specific VM."
+    Write-Output "91b: check VMware Tools on each VM."
+    Write-Output "92a: update VMware Tools on specific VM."
+    Write-Output "92b: update VMware Tools on each VM."
 
-    Write-Host "VM POWER AND REBOOT" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "101a: Press '101a' to check Power Status on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "101b: Press '101b' to check Power Status on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "102a: Press '102a' to reboot a specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "103a: Press '103a' to power on a specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "104a: Press '104a' to shutdown a specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "105a: Press '105a' to power off a specific VM." -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "VM POWER AND REBOOT"
+    Write-Output "101a: check Power Status on specific VM."
+    Write-Output "101b: check Power Status on each VM."
+    Write-Output "102a: reboot a specific VM."
+    Write-Output "103a: power on a specific VM."
+    Write-Output "104a: shutdown a specific VM."
+    Write-Output "105a: power off a specific VM."
 
-    Write-Host "VM CPU AND MEMORY" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "121a: Press '121a' to get weekly CPU and Memory usage report on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "121b: Press '121b' to get weekly CPU and Memory usage report on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "122a: Press '122a' to get monthly CPU and Memory usage report on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "122b: Press '122b' to get monthly CPU and Memory usage report on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "VM CPU AND MEMORY"
+    Write-Output "121a: get weekly CPU and Memory usage report on specific VM."
+    Write-Output "121b: get weekly CPU and Memory usage report on each VM."
+    Write-Output "122a: get monthly CPU and Memory usage report on specific VM."
+    Write-Output "122b: get monthly CPU and Memory usage report on each VM."
 
-    Write-Host "WINDOWS ADMIN ACCOUNTS" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "11a: Press '11a' to show users in Admins group on specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "11b: Press '11b' to show users in Admins group on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "12a: Press '12a' to add ADMT account to Admins group on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "12b: Press '12b' to add ADMT account to Admins group on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "13a: Press '13a' to test authentication of ADMT account." -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "WINDOWS ADMIN ACCOUNTS"
+    Write-Output "11a: show users in Admins group on specific VM."
+    Write-Output "11b: show users in Admins group on each VM."
+    Write-Output "12a: add ADMT account to Admins group on specific VM."
+    Write-Output "12b: add ADMT account to Admins group on each VM."
+    Write-Output "13a: test authentication of ADMT account."
 
-    Write-Host "WINDOWS SERVICES" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "31a: Press '31a' to get all services on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "31b: Press '31b' to get all services on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "32a: Press '32a' to check for a specific Service on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "32b: Press '32b' to check for a specific Service on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "WINDOWS SERVICES"
+    Write-Output "31a: get all services on specific VM."
+    Write-Output "31b: get all services on each VM."
+    Write-Output "32a: check for a specific Service on specific VM."
+    Write-Output "32b: check for a specific Service on each VM."
 
-    Write-Host "IP AND DNS ADDRESSES" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "21a: Press '21a' to get IP Address for specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "21b: Press '21b' to get IP Address for each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "22a: Press '22a' to get the current Domain for specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "22b: Press '22b' to get the current Domain for each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "23a: Press '23a' to get DNS Server Address on specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "23b: Press '23b' to get DNS Server Address for each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "24a: Press '24a' to set the DNS Server Address on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "24b: Press '24b' to set the DNS Server Address on each VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "25a: Press '25a' to register DNS on specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "25b: Press '25b' to register DNS on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "IP AND DNS ADDRESSES"
+    Write-Output "21a: get IP Address for specific VM."
+    Write-Output "21b: get IP Address for each VM."
+    Write-Output "22a: get the current Domain for specific VM."
+    Write-Output "22b: get the current Domain for each VM."
+    Write-Output "23a: get DNS Server Address on specific VM."
+    Write-Output "23b: get DNS Server Address for each VM."
+    Write-Output "24a: set the DNS Server Address on specific VM."
+    Write-Output "24b: set the DNS Server Address on each VM."
+    Write-Output "25a: register DNS on specific VM."
+    Write-Output "25b: register DNS on each VM."
 
-    Write-Host "NETWORK CONNECTIVITY" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "41a: Press '41a' to ping ComputerName of specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "41b: Press '41b' to ping ComputerName of each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "42a: Press '42a' to ping IP Address of specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "42b: Press '42b' to ping IP Address of each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "43a: Press '43a' to ping the Admin share on specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "43b: Press '43b' to ping the Admin share on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "44a: Press '44a' to test reachability of DC from specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "44b: Press '44b' to test reachability of DC from each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "44c: Press '44c' to test reachability of DC IP from each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "48a: Press '48a' to check ADMT ports on specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "48b: Press '48b' to check ADMT ports on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "NETWORK CONNECTIVITY"
+    Write-Output "41a: ping ComputerName of specific VM."
+    Write-Output "41b: ping ComputerName of each VM."
+    Write-Output "42a: ping IP Address of specific VM."
+    Write-Output "42b: ping IP Address of each VM."
+    Write-Output "43a: ping the Admin share on specific VM."
+    Write-Output "43b: ping the Admin share on each VM."
+    Write-Output "44a: test reachability of DC from specific VM."
+    Write-Output "44b: test reachability of DC from each VM."
+    Write-Output "44c: test reachability of DC IP from each VM."
+    Write-Output "48a: check ADMT ports on specific VM."
+    Write-Output "48b: check ADMT ports on each VM."
 
-    Write-Host "WINDOWS FIREWALL" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "51a: Press '51a' to get status of Windows Firewall on specific VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "51b: Press '51b' to get status of Windows Firewall on each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "52a: Press '52a' to disable Windows Firewall on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "52b: Press '52b' to disable Windows Firewall on each VM." -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "WINDOWS FIREWALL"
+    Write-Output "51a: get status of Windows Firewall on specific VM."
+    Write-Output "51b: get status of Windows Firewall on each VM."
+    Write-Output "52a: disable Windows Firewall on specific VM."
+    Write-Output "52b: disable Windows Firewall on each VM."
 
-    Write-Host "BACKUP POLICY" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "61a: Press '61a' to check Backup Policy on specific VM is set to Exclude." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "61b: Press '61b' to check Backup Policy on each VM is set to Exclude." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "62a: Press '62a' to check Backup Policy on specific VM is set to Snapshot." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "62b: Press '62b' to check Backup Policy on each VM is set to Snapshot." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "64a: Press '64a' to set Backup Policy to Exclude on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "64b: Press '64b' to set Backup Policy to Exclude on each VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "65a: Press '65a' to set Backup Policy to Snapshot on specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "65b: Press '65b' to set Backup Policy to Snapshot on each VM." -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "BACKUP POLICY"
+    Write-Output "61a: check Backup Policy on specific VM is set to Exclude."
+    Write-Output "61b: check Backup Policy on each VM is set to Exclude."
+    Write-Output "62a: check Backup Policy on specific VM is set to Snapshot."
+    Write-Output "62b: check Backup Policy on each VM is set to Snapshot."
+    Write-Output "64a: set Backup Policy to Exclude on specific VM."
+    Write-Output "64b: set Backup Policy to Exclude on each VM."
+    Write-Output "65a: set Backup Policy to Snapshot on specific VM."
+    Write-Output "65b: set Backup Policy to Snapshot on each VM."
 
-    Write-Host "MANUAL MOVES" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "81a: Press '81a' to manually move specific VM to new domain." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "81b: Press '81b' to manually move each VM to new domain." -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "MANUAL MOVES"
+    Write-Output "81a: manually move specific VM to new domain."
+    Write-Output "81b: manually move each VM to new domain."
 
-    Write-Host "SNAPSHOTS" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "71a: Press '71a' to take Snapshot of specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "71b: Press '71b' to take Snapshot of each VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "72a: Press '72a' to remove all Snapshots of specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "72b: Press '72b' to remove all Snapshots of each VM." -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "SNAPSHOTS"
+    Write-Output "71a: take Snapshot of specific VM."
+    Write-Output "71b: take Snapshot of each VM."
+    Write-Output "72a: remove all Snapshots of specific VM."
+    Write-Output "72b: remove all Snapshots of each VM."
 
-    Write-Host "VMOTION" -ForegroundColor DarkYellow -BackgroundColor Black
-    Write-Host "111a: Press '111a' to get 24-hours of VMotion events of specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "111b: Press '111b' to get 24-hours of VMotion events of each VM." -ForegroundColor DarkGreen -BackgroundColor Black
-    Write-Host "112a: Press '112a' to get 1-week of VMotion events of specific VM." -ForegroundColor Blue -BackgroundColor Black
-    Write-Host "112b: Press '112b' to get 1-week of VMotion events of each VM." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "VMOTION"
+    Write-Output "111a: get 24-hours of VMotion events of specific VM."
+    Write-Output "111b: get 24-hours of VMotion events of each VM."
+    Write-Output "112a: get 1-week of VMotion events of specific VM."
+    Write-Output "112b: get 1-week of VMotion events of each VM."
 
-    Write-Host "Q: Press 'Q' to quit."
 }
 
 <# VCENTER AND LIST VERIFICATION #>
 function Connect-2vCenter {
-    Connect-VIServer -Server $vCenter -Credential $vCenterCreds
-}
-
-function New-NetworkCredentialFromCredential {
-    param (
-        [Parameter(Mandatory)]
-        [System.Management.Automation.PSCredential]$Credential
-    )
-
-    $plainTextPassword = $Credential.GetNetworkCredential().Password
-
-    if ($Credential.UserName -match '^(?<Domain>[^\\]+)\\(?<User>.+)$') {
-        return [System.Net.NetworkCredential]::new($Matches.User, $plainTextPassword, $Matches.Domain)
-    }
-
-    return [System.Net.NetworkCredential]::new($Credential.UserName, $plainTextPassword)
+    Connect-VIServer -Server $Server -Credential $vCenterCredential -Force -ErrorAction Stop
 }
 
 function Get-PrimaryIPv4Address {
     param (
         [Parameter(Mandatory)]
-        [string]$VMName
+        $VMName
     )
 
     $guestInfo = Get-VMGuest -VM $VMName -ErrorAction Stop
@@ -414,113 +434,108 @@ function Show-AdminShareStatus {
 
     if ($env:OS -eq 'Windows_NT') {
         if (Test-Path "\\$ComputerName\Admin$") {
-            Write-Host "Admin share is reachable on $ComputerName" -ForegroundColor DarkGreen -BackgroundColor Black
+            Write-Output "Admin share is reachable on $ComputerName"
         }
         else {
-            Write-Host "Admin share is not reachable on $ComputerName" -ForegroundColor Red -BackgroundColor Black
+            Write-Output "Admin share is not reachable on $ComputerName"
         }
 
         return
     }
 
     if (Test-TcpPort -ComputerName $ComputerName -Port 445) {
-        Write-Host "TCP 445 is reachable on $ComputerName. Share-level validation requires a Windows host." -ForegroundColor DarkGreen -BackgroundColor Black
+        Write-Output "TCP 445 is reachable on $ComputerName. Share-level validation requires a Windows host."
     }
     else {
-        Write-Host "TCP 445 is not reachable on $ComputerName" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "TCP 445 is not reachable on $ComputerName"
     }
 }
 
 function Get-LocationOfVM {
-    if (VMware.VimAutomation.Core\Get-VM -Name $VM -ErrorAction SilentlyContinue) {
-        Write-Host "$VM exists in vCenter" -ForegroundColor DarkGreen -BackgroundColor Black
-    } else {
-        Write-Host "$VM does not exist in vCenter" -ForegroundColor Red -BackgroundColor Black
-    }
+    $found = @(Get-VM -Name ([WildcardPattern]::Escape($VM)) -Server $Server -ErrorAction SilentlyContinue | Where-Object Name -EQ $VM)
+    [pscustomobject]@{VM = $VM; Server = [string]$Server; Matches = $found.Count }
 }
 
 <# VM CPU AND MEMORY #>
 function Get-WeeklyCPURAM4VM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting CPU and Memory Weekly Usage Report for $TargetVM" -ForegroundColor Blue -BackgroundColor Black
+    Write-Verbose "Getting CPU and Memory Weekly Usage Report for $TargetVM"
     $AllVMs = @()
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | ForEach-Object {
+    $TargetVM | ForEach-Object {
         $vmstat = '' | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
         $vmstat.VmName = "$TargetVM"
-        $statcpuweek = Get-Stat -Entity ($TargetVM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat cpu.usage.average
-        $statmemweek = Get-Stat -Entity ($TargetVM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat mem.usage.average
+        $statcpuweek = Get-Stat -Server $Server -Instance '' -Entity ($TargetVM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat cpu.usage.average
+        $statmemweek = Get-Stat -Server $Server -Instance '' -Entity ($TargetVM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat mem.usage.average
         $cpuweek = $statcpuweek | Measure-Object -Property Value -Average -Maximum -Minimum
         $memweek = $statmemweek | Measure-Object -Property Value -Average -Maximum -Minimum
-        $vmstat.CPUMax = [math]::Round($cpuweek.Maximum)
-        $vmstat.CPUAvg = [math]::Round($cpuweek.Average)
-        $vmstat.CPUMin = [math]::Round($cpuweek.Minimum)
-        $vmstat.MemMax = [math]::Round($memweek.Maximum)
-        $vmstat.MemAvg = [math]::Round($memweek.Average)
-        $vmstat.MemMin = [math]::Round($memweek.Minimum)
+        $vmstat.CPUMax = if ($cpuweek.Count) { [math]::Round($cpuweek.Maximum) }
+        $vmstat.CPUAvg = if ($cpuweek.Count) { [math]::Round($cpuweek.Average) }
+        $vmstat.CPUMin = if ($cpuweek.Count) { [math]::Round($cpuweek.Minimum) }
+        $vmstat.MemMax = if ($memweek.Count) { [math]::Round($memweek.Maximum) }
+        $vmstat.MemAvg = if ($memweek.Count) { [math]::Round($memweek.Average) }
+        $vmstat.MemMin = if ($memweek.Count) { [math]::Round($memweek.Minimum) }
         $AllVMs += $vmstat
     }
     $AllVMs | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
 }
 
 function Get-WeeklyCPURAM4All {
-    Write-Host "Getting CPU and Memory Weekly Usage Report for $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Getting CPU and Memory Weekly Usage Report for $VM"
     $AllVMs = @()
-    (VMware.VimAutomation.Core\Get-VM $VM) | ForEach-Object {
+    $VM | ForEach-Object {
         $vmstat = '' | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
         $vmstat.VmName = "$VM"
-        $statcpuweek = Get-Stat -Entity ($VM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat cpu.usage.average
-        $statmemweek = Get-Stat -Entity ($VM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat mem.usage.average
+        $statcpuweek = Get-Stat -Server $Server -Instance '' -Entity ($VM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat cpu.usage.average
+        $statmemweek = Get-Stat -Server $Server -Instance '' -Entity ($VM) -Start (Get-Date).AddDays(-7) -Finish (Get-Date) -MaxSamples 100 -Stat mem.usage.average
         $cpuweek = $statcpuweek | Measure-Object -Property Value -Average -Maximum -Minimum
         $memweek = $statmemweek | Measure-Object -Property Value -Average -Maximum -Minimum
-        $vmstat.CPUMax = [math]::Round($cpuweek.Maximum)
-        $vmstat.CPUAvg = [math]::Round($cpuweek.Average)
-        $vmstat.CPUMin = [math]::Round($cpuweek.Minimum)
-        $vmstat.MemMax = [math]::Round($memweek.Maximum)
-        $vmstat.MemAvg = [math]::Round($memweek.Average)
-        $vmstat.MemMin = [math]::Round($memweek.Minimum)
+        $vmstat.CPUMax = if ($cpuweek.Count) { [math]::Round($cpuweek.Maximum) }
+        $vmstat.CPUAvg = if ($cpuweek.Count) { [math]::Round($cpuweek.Average) }
+        $vmstat.CPUMin = if ($cpuweek.Count) { [math]::Round($cpuweek.Minimum) }
+        $vmstat.MemMax = if ($memweek.Count) { [math]::Round($memweek.Maximum) }
+        $vmstat.MemAvg = if ($memweek.Count) { [math]::Round($memweek.Average) }
+        $vmstat.MemMin = if ($memweek.Count) { [math]::Round($memweek.Minimum) }
         $AllVMs += $vmstat
     }
     $AllVMs | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
 }
 
 function Get-MonthlyCPURAM4VM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting CPU and Memory Monthly Usage Report for $TargetVM" -ForegroundColor Blue -BackgroundColor Black
+    Write-Verbose "Getting CPU and Memory Monthly Usage Report for $TargetVM"
     $AllVMs = @()
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | ForEach-Object {
+    $TargetVM | ForEach-Object {
         $vmstat = '' | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
         $vmstat.VmName = "$TargetVM"
-        $statcpumonth = Get-Stat -Entity ($TargetVM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat cpu.usage.average
-        $statmemmonth = Get-Stat -Entity ($TargetVM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat mem.usage.average
+        $statcpumonth = Get-Stat -Server $Server -Instance '' -Entity ($TargetVM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat cpu.usage.average
+        $statmemmonth = Get-Stat -Server $Server -Instance '' -Entity ($TargetVM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat mem.usage.average
         $cpumonth = $statcpumonth | Measure-Object -Property value -Average -Maximum -Minimum
         $memmonth = $statmemmonth | Measure-Object -Property value -Average -Maximum -Minimum
-        $vmstat.CPUMax = [math]::Round($cpumonth.Maximum)
-        $vmstat.CPUAvg = [math]::Round($cpumonth.Average)
-        $vmstat.CPUMin = [math]::Round($cpumonth.Minimum)
-        $vmstat.MemMax = [math]::Round($memmonth.Maximum)
-        $vmstat.MemAvg = [math]::Round($memmonth.Average)
-        $vmstat.MemMin = [math]::Round($memmonth.Minimum)
+        $vmstat.CPUMax = if ($cpumonth.Count) { [math]::Round($cpumonth.Maximum) }
+        $vmstat.CPUAvg = if ($cpumonth.Count) { [math]::Round($cpumonth.Average) }
+        $vmstat.CPUMin = if ($cpumonth.Count) { [math]::Round($cpumonth.Minimum) }
+        $vmstat.MemMax = if ($memmonth.Count) { [math]::Round($memmonth.Maximum) }
+        $vmstat.MemAvg = if ($memmonth.Count) { [math]::Round($memmonth.Average) }
+        $vmstat.MemMin = if ($memmonth.Count) { [math]::Round($memmonth.Minimum) }
         $AllVMs += $vmstat
     }
     $AllVMs | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
 }
 
 function Get-MonthlyCPURAM4All {
-    Write-Host "Getting CPU and Memory Monthly Usage Report for $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Getting CPU and Memory Monthly Usage Report for $VM"
     $AllVMs = @()
-    (VMware.VimAutomation.Core\Get-VM $VM) | ForEach-Object {
+    $VM | ForEach-Object {
         $vmstat = '' | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
         $vmstat.VmName = "$VM"
-        $statcpumonth = Get-Stat -Entity ($VM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat cpu.usage.average
-        $statmemmonth = Get-Stat -Entity ($VM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat mem.usage.average
+        $statcpumonth = Get-Stat -Server $Server -Instance '' -Entity ($VM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat cpu.usage.average
+        $statmemmonth = Get-Stat -Server $Server -Instance '' -Entity ($VM) -Start (Get-Date).AddDays(-30) -Finish (Get-Date) -MaxSamples 1000 -Stat mem.usage.average
         $cpumonth = $statcpumonth | Measure-Object -Property value -Average -Maximum -Minimum
         $memmonth = $statmemmonth | Measure-Object -Property value -Average -Maximum -Minimum
-        $vmstat.CPUMax = [math]::Round($cpumonth.Maximum)
-        $vmstat.CPUAvg = [math]::Round($cpumonth.Average)
-        $vmstat.CPUMin = [math]::Round($cpumonth.Minimum)
-        $vmstat.MemMax = [math]::Round($memmonth.Maximum)
-        $vmstat.MemAvg = [math]::Round($memmonth.Average)
-        $vmstat.MemMin = [math]::Round($memmonth.Minimum)
+        $vmstat.CPUMax = if ($cpumonth.Count) { [math]::Round($cpumonth.Maximum) }
+        $vmstat.CPUAvg = if ($cpumonth.Count) { [math]::Round($cpumonth.Average) }
+        $vmstat.CPUMin = if ($cpumonth.Count) { [math]::Round($cpumonth.Minimum) }
+        $vmstat.MemMax = if ($memmonth.Count) { [math]::Round($memmonth.Maximum) }
+        $vmstat.MemAvg = if ($memmonth.Count) { [math]::Round($memmonth.Average) }
+        $vmstat.MemMin = if ($memmonth.Count) { [math]::Round($memmonth.Minimum) }
         $AllVMs += $vmstat
     }
     $AllVMs | Select-Object VmName, CPUMin, CPUAvg, CPUMax, MemMin, MemAvg, MemMax
@@ -528,33 +543,31 @@ function Get-MonthlyCPURAM4All {
 
 <# WINDOWS ADMIN ACCOUNTS #>
 function Get-UsersInAdminGroup {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting users in Administrators group on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $UsersInGroup
+    Write-Verbose "Getting users in Administrators group on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $UsersInGroup
     $SO.ScriptOutput
 }
 
 function Get-UsersInAdminGroupAll {
-    Write-Host "Getting users in Administrators group on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $UsersInGroup
+    Write-Verbose "Getting users in Administrators group on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $UsersInGroup
     $SO.ScriptOutput
 }
 
 function Add-Account2Group {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Adding $ADMTAccount to Administrators group on $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $Add2GroupCD
+    Write-Output "Adding $ADMTAccount to Administrators group on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $Add2GroupCD
     $SO.ScriptOutput
 }
 
 function Add-Account2GroupAll {
-    Write-Host "Adding $ADMTAccount to Administrators group on $VM" -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $Add2GroupCD
+    Write-Output "Adding $ADMTAccount to Administrators group on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $Add2GroupCD
     $SO.ScriptOutput
 }
 
 function Test-ADAuthentication {
-    Write-Host "Testing ADMT authentication against $DCIP" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Testing ADMT authentication against $DCIP"
 
     $targetDirectoryServer = if ([string]::IsNullOrWhiteSpace($DCIP)) {
         "$DC.$Domain"
@@ -570,14 +583,14 @@ function Test-ADAuthentication {
         $ldapConnection = [System.DirectoryServices.Protocols.LdapConnection]::new($directoryIdentifier)
         $ldapConnection.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
         $ldapConnection.SessionOptions.ProtocolVersion = 3
-        $ldapConnection.Credential = New-NetworkCredentialFromCredential -Credential $ADMTCreds
+        $ldapConnection.Credential = $ADMTCreds.GetNetworkCredential()
         $ldapConnection.Bind()
 
-        Write-Host "ADMT authentication succeeded." -ForegroundColor DarkGreen -BackgroundColor Black
+        Write-Output "ADMT authentication succeeded."
         $true
     }
     catch {
-        Write-Host "ADMT authentication failed: $($_.Exception.Message)" -ForegroundColor Red -BackgroundColor Black
+        Write-Warning "ADMT authentication failed: $($_.Exception.Message)"
         $false
     }
     finally {
@@ -589,382 +602,358 @@ function Test-ADAuthentication {
 
 <# IP AND DNS ADDRESSES #>
 function Get-IPAddress4VM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting IP of $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Getting IP of $TargetVM"
     Get-PrimaryIPv4Address -VMName $TargetVM
 }
 function Get-IPAddress4VMAll {
-    Write-Host "Getting IP of $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Getting IP of $VM"
     Get-PrimaryIPv4Address -VMName $VM
 }
 
 function Get-DomainOnVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting Domain of $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainOnVM
+    Write-Verbose "Getting Domain of $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainOnVM
     $SO.ScriptOutput
 }
 
 function Get-DomainOnVMAll {
-    Write-Host "Getting Domain of $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainOnVM
+    Write-Verbose "Getting Domain of $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainOnVM
     $SO.ScriptOutput
 }
 
 function Get-DNSServerAddress {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting DNS Server Address on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDNSAddress
+    Write-Verbose "Getting DNS Server Address on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDNSAddress
     $SO.ScriptOutput
 }
 
 function Get-DNSServerAddressAll {
-    Write-Host "Getting DNS Server Address on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDNSAddress
+    Write-Verbose "Getting DNS Server Address on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDNSAddress
     $SO.ScriptOutput
 }
 
 function Set-DNSServerAddress {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Setting DNS Server Addresses on $TargetVM..." -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $SetDNSAddress
+    Write-Verbose "Setting DNS Server Addresses on $TargetVM..."
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $SetDNSAddress
     $SO.ScriptOutput
-    Write-Host "DNS Server Addresses on $TargetVM have been updated." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "DNS Server Addresses on $TargetVM have been updated."
 }
 
 function Set-DNSServerAddressAll {
-    Write-Host "Setting DNS Server Addresses on $VM..." -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $SetDNSAddress
+    Write-Verbose "Setting DNS Server Addresses on $VM..."
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $SetDNSAddress
     $SO.ScriptOutput
-    Write-Host "DNS Server Addresses on $VM have been updated." -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "DNS Server Addresses on $VM have been updated."
 }
 
 function Invoke-RegisterDNS {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Registering DNS on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $RegisterDNS
+    Write-Output "Registering DNS on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $RegisterDNS
     $SO.ScriptOutput
 }
 
 function Invoke-RegisterDNSAll {
-    Write-Host "Registering DNS on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $RegisterDNS
+    Write-Output "Registering DNS on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $RegisterDNS
     $SO.ScriptOutput
 }
 
 <# WINDOWS SERVICES #>
 function Get-ServicesOnVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting List of all Services on $TargetVM"
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetSvcOnVM
+    Write-Verbose "Getting List of all Services on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetSvcOnVM
     $SO.ScriptOutput
 }
 
 function Get-ServicesAll {
-    Write-Host "Getting List of all Services on $VM"
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetSvcOnVM
+    Write-Verbose "Getting List of all Services on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetSvcOnVM
     $SO.ScriptOutput
 }
 
 function Get-SpecificSVC {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Finding Service on $TargetVM"
-    $SO1 = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainSvc
+    Write-Verbose "Finding Service on $TargetVM"
+    $SO1 = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainSvc
     if (-not [string]::IsNullOrWhiteSpace($SO1.ScriptOutput)) {
-        Write-Host "Service Found on $TargetVM" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "Service Found on $TargetVM"
         $SO1.ScriptOutput
-    } else {
-        Write-Host "Service not Found on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    }
+    else {
+        Write-Output "Service not Found on $TargetVM"
     }
 }
 
 function Get-SpecificSVCAll {
-    Write-Host "Finding Service on $VM"
-    $SO1 = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainSvc
+    Write-Verbose "Finding Service on $VM"
+    $SO1 = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $GetDomainSvc
     if (-not [string]::IsNullOrWhiteSpace($SO1.ScriptOutput)) {
-        Write-Host "Service Found on $VM" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "Service Found on $VM"
         $SO1.ScriptOutput
-    } else {
-        Write-Host "Service not Found on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    }
+    else {
+        Write-Output "Service not Found on $VM"
     }
 }
 
 <# NETWORK CONNECTIVITY #>
 function Get-PingStatus {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Pinging $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Pinging $TargetVM"
     Test-Connection -TargetName $TargetVM -ResolveDestination | Select-Object -ExpandProperty Status
 }
 
 function Get-PingStatusAll {
-    Write-Host "Pinging $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Pinging $VM"
     Test-Connection -TargetName $VM -ResolveDestination | Select-Object -ExpandProperty Status
 }
 
 function Get-PingStatusIP {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Pinging IP of $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Pinging IP of $TargetVM"
     $IP = Get-PrimaryIPv4Address -VMName $TargetVM
     Test-Connection -TargetName $IP -IPv4 -ResolveDestination | Select-Object -ExpandProperty Status
 }
 
 function Get-PingStatusIPAll {
-    Write-Host "Pinging IP of $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Pinging IP of $VM"
     $IP = Get-PrimaryIPv4Address -VMName $VM
     Test-Connection -TargetName $IP -IPv4 -ResolveDestination | Select-Object -ExpandProperty Status
 }
 
 function Get-PingStatusAdmin {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Checking Admin Share on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Checking Admin Share on $TargetVM"
     Show-AdminShareStatus -ComputerName $TargetVM
 }
 
 function Get-PingStatusAdminAll {
-    Write-Host "Checking Admin Share on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Checking Admin Share on $VM"
     Show-AdminShareStatus -ComputerName $VM
 }
 
 function Test-ReachDomain {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Testing $DC.$Domain reachability from $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $PingDC
+    Write-Verbose "Testing $DC.$Domain reachability from $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $PingDC
     $SO.ScriptOutput
 }
 
 function Test-ReachDomainAll {
-    Write-Host "Testing $DC.$Domain reachability from $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $PingDC
+    Write-Verbose "Testing $DC.$Domain reachability from $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $PingDC
     $SO.ScriptOutput
 }
 
 function Test-ReachDomainDCIP {
-    Write-Host "Testing $DCIP reachability from $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $PingDCIP
+    Write-Verbose "Testing $DCIP reachability from $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $PingDCIP
     $SO.ScriptOutput
 }
 
 function Test-ADMTPort {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Checking ADMT-related ports from $TargetVM to $DCIP" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $TestADMTPortsScript
+    Write-Verbose "Checking ADMT-related ports from $TargetVM to $DCIP"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $TestADMTPortsScript
     $SO.ScriptOutput
 }
 
 function Test-ADMTPortsAll {
-    Write-Host "Checking ADMT-related ports from $VM to $DCIP" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $TestADMTPortsScript
+    Write-Verbose "Checking ADMT-related ports from $VM to $DCIP"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $TestADMTPortsScript
     $SO.ScriptOutput
 }
 
 <# WINDOWS FIREWALL #>
 function Get-WinFirewallStatus {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting Firewall Status on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWStatus
+    Write-Verbose "Getting Firewall Status on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWStatus
     $SO.ScriptOutput
 }
 
 function Get-WinFirewallStatusAll {
-    Write-Host "Getting Firewall Status on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWStatus
+    Write-Verbose "Getting Firewall Status on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWStatus
     $SO.ScriptOutput
 }
 
 function Set-WinFirewallOff {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Disabling Windows Firewall on $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWDisable
+    Write-Output "Disabling Windows Firewall on $TargetVM"
+    $SO = Invoke-CheckedGuestScript -VM ($TargetVM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWDisable
     $SO.ScriptOutput
 }
 
 function Set-WinFirewallOffAll {
-    Write-Host "Disabling Windows Firewall on $VM" -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWDisable
+    Write-Output "Disabling Windows Firewall on $VM"
+    $SO = Invoke-CheckedGuestScript -VM ($VM) -GuestCredential $GuestCreds -ScriptType Powershell -ScriptText $FWDisable
     $SO.ScriptOutput
 }
 
 <# BACKUP FUNCTIONS #>
 function Show-BackupPolicyExclude {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Checking Backup Policy on $TargetVM"
+    Write-Verbose "Checking Backup Policy on $TargetVM"
     $BUExclude = Get-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" | Select-Object Value
     if ($BUExclude.Value -eq "Exclude") {
-        Write-Host "Backup Policy on $TargetVM set to Exclude" -ForegroundColor DarkGreen -BackgroundColor Black
-    } else {
-        Write-Host "Backup Policy on $TargetVM NOT set to Exclude" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "Backup Policy on $TargetVM set to Exclude"
+    }
+    else {
+        Write-Output "Backup Policy on $TargetVM NOT set to Exclude"
     }
 }
 
 function Show-BackupPolicyExcludeAll {
-    Write-Host "Checking Backup Policy on $VM"
+    Write-Verbose "Checking Backup Policy on $VM"
     $BUExclude = Get-Annotation -Entity $VM -CustomAttribute "BackupPolicy" | Select-Object Value
     if ($BUExclude.Value -eq "Exclude") {
-        Write-Host "Backup Policy on $VM set to Exclude" -ForegroundColor DarkGreen -BackgroundColor Black
-    } else {
-        Write-Host "Backup Policy on $VM NOT set to Exclude" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "Backup Policy on $VM set to Exclude"
+    }
+    else {
+        Write-Output "Backup Policy on $VM NOT set to Exclude"
     }
 }
 
 function Show-BackupPolicySnapshot {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Checking Backup Policy on $TargetVM"
+    Write-Verbose "Checking Backup Policy on $TargetVM"
     $BUSnapshot = Get-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" | Select-Object Value
     if ($BUSnapshot.Value -eq "Snapshot") {
-        Write-Host "Backup Policy on $TargetVM set to Snapshot" -ForegroundColor DarkGreen -BackgroundColor Black
-    } else {
-        Write-Host "Backup Policy on $TargetVM NOT set to Snapshot" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "Backup Policy on $TargetVM set to Snapshot"
+    }
+    else {
+        Write-Output "Backup Policy on $TargetVM NOT set to Snapshot"
     }
 }
 
 function Show-BackupPolicySnapshotAll {
-    Write-Host "Checking Backup Policy on $VM"
+    Write-Verbose "Checking Backup Policy on $VM"
     $BUSnapshot = Get-Annotation -Entity $VM -CustomAttribute "BackupPolicy" | Select-Object Value
     if ($BUSnapshot.Value -eq "Snapshot") {
-        Write-Host "Backup Policy on $VM set to Snapshot" -ForegroundColor DarkGreen -BackgroundColor Black
-    } else {
-        Write-Host "Backup Policy on $VM NOT set to Snapshot" -ForegroundColor Red -BackgroundColor Black
+        Write-Output "Backup Policy on $VM set to Snapshot"
+    }
+    else {
+        Write-Output "Backup Policy on $VM NOT set to Snapshot"
     }
 }
 
 function Set-BackupPolicy2Exclude {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Setting VMs Backup Policy to Exclude"
+    Write-Verbose "Setting VMs Backup Policy to Exclude"
     if ((Get-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" | Select-Object -ExpandProperty Value) -ne "Exclude") {
-            Write-Host "Setting Backup Policy on $TargetVM to Exclude" -ForegroundColor Blue -BackgroundColor Black
-            Set-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" -Value "Exclude"
-        }
-    Write-Host "Finished setting Backup Policy on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+        Write-Verbose "Setting Backup Policy on $TargetVM to Exclude"
+        Set-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" -Value "Exclude"
+    }
+    Write-Verbose "Finished setting Backup Policy on $TargetVM"
 }
 
 function Set-BackupPolicy2ExcludeAll {
-    Write-Host "Setting VMs Backup Policy to Exclude"
+    Write-Verbose "Setting VMs Backup Policy to Exclude"
     if ((Get-Annotation -Entity $VM -CustomAttribute "BackupPolicy" | Select-Object -ExpandProperty Value) -ne "Exclude") {
-            Write-Host "Setting Backup Policy on $VM to Exclude" -ForegroundColor Blue -BackgroundColor Black
-            Set-Annotation -Entity $VM -CustomAttribute "BackupPolicy" -Value "Exclude"
-        }
-    Write-Host "Finished setting Backup Policy on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+        Write-Verbose "Setting Backup Policy on $VM to Exclude"
+        Set-Annotation -Entity $VM -CustomAttribute "BackupPolicy" -Value "Exclude"
+    }
+    Write-Verbose "Finished setting Backup Policy on $VM"
 }
 
 function Set-BackupPolicy2Snapshot {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Setting VMs Backup Policy to Snapshot"
+    Write-Verbose "Setting VMs Backup Policy to Snapshot"
     if ((Get-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" | Select-Object -ExpandProperty Value) -ne "Snapshot") {
-            Write-Host "Setting Backup Policy on $TargetVM to Snapshot" -ForegroundColor Blue -BackgroundColor Black
-            Set-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" -Value "Snapshot"
-        }
-    Write-Host "Finished setting Backup Policy on $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+        Write-Verbose "Setting Backup Policy on $TargetVM to Snapshot"
+        Set-Annotation -Entity $TargetVM -CustomAttribute "BackupPolicy" -Value "Snapshot"
+    }
+    Write-Verbose "Finished setting Backup Policy on $TargetVM"
 }
 
 function Set-BackupPolicy2SnapshotAll {
-    Write-Host "Setting VMs Backup Policy to Snapshot"
+    Write-Verbose "Setting VMs Backup Policy to Snapshot"
     if ((Get-Annotation -Entity $VM -CustomAttribute "BackupPolicy" | Select-Object -ExpandProperty Value) -ne "Snapshot") {
-            Write-Host "Setting Backup Policy on $VM to Snapshot" -ForegroundColor Blue -BackgroundColor Black
-            Set-Annotation -Entity $VM -CustomAttribute "BackupPolicy" -Value "Snapshot"
-        }
-    Write-Host "Finished setting Backup Policy on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+        Write-Verbose "Setting Backup Policy on $VM to Snapshot"
+        Set-Annotation -Entity $VM -CustomAttribute "BackupPolicy" -Value "Snapshot"
+    }
+    Write-Verbose "Finished setting Backup Policy on $VM"
 }
 
 <# SNAPSHOT FUNCTIONS #>
 function New-Snap4Salvation {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Creating new snapshot of $TargetVM" -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "Creating new snapshot of $TargetVM"
     New-Snapshot -VM $TargetVM -Name "$TargetVM.SNAPSHOT" -Description "Snapshot" -Quiesce -Memory:$false -Confirm:$false
-    Write-Host "Finished creating new snapshot of $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Finished creating new snapshot of $TargetVM"
 }
 
 function New-Snap4SalvationAll {
-    Write-Host "Creating new snapshot of $VM" -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "Creating new snapshot of $VM"
     New-Snapshot -VM $VM -Name "$VM.SNAPSHOT" -Description "Snapshot" -Quiesce -Memory:$false -Confirm:$false
-    Write-Host "Finished creating new snapshot of $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Verbose "Finished creating new snapshot of $VM"
 }
 
 function Remove-AllSnapshots4VM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Removing Snapshots for $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | Get-Snapshot | ForEach-Object {Remove-Snapshot $_ -Confirm:$false}
-    Write-Host "Finished removing Snapshots for $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "Removing Snapshots for $TargetVM"
+    $TargetVM | Get-Snapshot | ForEach-Object { Remove-Snapshot $_ -Confirm:$false }
+    Write-Verbose "Finished removing Snapshots for $TargetVM"
 
 }
 
 function Remove-AllSnapshots4All {
-    Write-Host "Removing Snapshots for each $VM" -ForegroundColor Blue -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $VM) | Get-Snapshot | ForEach-Object {Remove-Snapshot $_ -Confirm:$false}
-    Write-Host "Finished removing Snapshots for $VM" -ForegroundColor DarkGreen -BackgroundColor Black
+    Write-Output "Removing Snapshots for each $VM"
+    $VM | Get-Snapshot | ForEach-Object { Remove-Snapshot $_ -Confirm:$false }
+    Write-Verbose "Finished removing Snapshots for $VM"
 }
 
 <# MANUAL MOVE FUNCTIONS #>
 function Add-VM2NewDomain {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Moving $TargetVM to new domain..." -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($TargetVM) -GuestCredential $ADMTCreds -ScriptType Powershell -ScriptText $ManualMoveScript
-    $SO.ScriptOutput
-    Write-Host "Done!" -ForegroundColor Green -BackgroundColor Black
+    Write-Verbose "Moving $TargetVM to new domain..."
+    Join-GuestDomain -VM $TargetVM -Domain $Domain -GuestCredential $GuestCredential -DomainCredential $DomainCredential
+    Write-Verbose "Done!"
 }
 
 function Add-VM2NewDomainAll {
-    Write-Host "Moving $VM to new domain..." -ForegroundColor Blue -BackgroundColor Black
-    $SO = Invoke-VMScript -VM ($VM) -GuestCredential $ADMTCreds -ScriptType Powershell -ScriptText $ManualMoveScript
-    $SO.ScriptOutput
-    Write-Host "Done!" -ForegroundColor Green -BackgroundColor Black
+    Write-Verbose "Moving $VM to new domain..."
+    Join-GuestDomain -VM $VM -Domain $Domain -GuestCredential $GuestCredential -DomainCredential $DomainCredential
+    Write-Verbose "Done!"
 }
 
 <# VMWARE TOOLS STATUS #>
 function Get-VMwareToolsStatusOfVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting VMware Tools Status of $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    ((VMware.VimAutomation.Core\Get-VM $TargetVM) | Get-View).Guest.ToolsStatus
+    Write-Verbose "Getting VMware Tools Status of $TargetVM"
+    ($TargetVM | Get-View).Guest.ToolsStatus
 }
 
 function Get-VMwareToolsStatusOfVMAll {
-    Write-Host "Getting VMware Tools Status of $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    ((VMware.VimAutomation.Core\Get-VM $VM) | Get-View).Guest.ToolsStatus
+    Write-Verbose "Getting VMware Tools Status of $VM"
+    ($VM | Get-View).Guest.ToolsStatus
 }
 
 function Update-VmWareToolsOnVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Updating VmWare Tools on $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | Update-Tools -NoReboot
+    Write-Verbose "Updating VmWare Tools on $TargetVM"
+    Update-EligibleVMTool $TargetVM
 }
 
 function Update-VmWareToolsOnVMAll {
-    Write-Host "Updating VmWare Tools on $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $VM) | Update-Tools -NoReboot
+    Write-Verbose "Updating VmWare Tools on $VM"
+    Update-EligibleVMTool $VM
 }
 
 <# VM POWER AND REBOOT #>
 function Get-PowerStatusOfVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting Power Status of $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | Select-Object Powerstate
+    Write-Verbose "Getting Power Status of $TargetVM"
+    $TargetVM | Select-Object Powerstate
 }
 
 function Get-PowerStatusOfVMAll {
-    Write-Host "Getting Power Status of $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $VM) | Select-Object Powerstate
+    Write-Verbose "Getting Power Status of $VM"
+    $VM | Select-Object Powerstate
 }
 
 function Invoke-RebootOfVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Restarting $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    Restart-VMGuest -VM $TargetVM
+    Write-Output "Restarting $TargetVM"
+    Restart-VMGuest -VM $TargetVM -Confirm:$false
 }
 
 function Start-PoweredOffVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Starting $TargetVM" -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "Starting $TargetVM"
     Start-VM -VM $TargetVM -Confirm:$false
 }
 
 function Invoke-ShutdownOfVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Shutting down $TargetVM" -ForegroundColor Blue -BackgroundColor Black
-    Stop-VMGuest -VM $TargetVM -Confirm:$False
+    Write-Output "Shutting down $TargetVM"
+    Stop-VMGuest -VM $TargetVM -Confirm:$false
 }
 
 function Invoke-PowerOffOfVM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Powering off $TargetVM" -ForegroundColor Blue -BackgroundColor Black
+    Write-Output "Powering off $TargetVM"
     Stop-VM -VM $TargetVM -Confirm:$False
 }
 
@@ -979,12 +968,13 @@ function Get-VMotion {
 
     process {
         $ResolvedVM = if ($VM -is [string]) {
-            VMware.VimAutomation.Core\Get-VM -Name $VM -ErrorAction Stop
-        } else {
+            Get-ExactVM $VM
+        }
+        else {
             $VM
         }
 
-        Get-VIEvent -Entity $ResolvedVM -Start (Get-Date).AddDays(-$Days) |
+        Get-VIEvent -Server $Server -Entity $ResolvedVM -Start (Get-Date).AddDays(-$Days) |
             Where-Object {
                 $_.FullFormattedMessage -match '(?i)vmotion|migrat' -or
                 $_.GetType().Name -match 'Migrat'
@@ -994,394 +984,407 @@ function Get-VMotion {
 }
 
 function Get-DailyVmotion4VM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting 24-hour vMotion events for $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | Get-VMotion -Days 1 | Format-List *
+    Write-Verbose "Getting 24-hour vMotion events for $TargetVM"
+    $TargetVM | Get-VMotion -Days 1 | Format-List *
 }
 
 function Get-DailyVmotion4All {
-    Write-Host "Getting 24-hour vMotion events for $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $VM) | Get-VMotion -Days 1 | Format-List *
+    Write-Verbose "Getting 24-hour vMotion events for $VM"
+    $VM | Get-VMotion -Days 1 | Format-List *
 }
 
 function Get-WeeklyVmotion4VM {
-    $TargetVM = Read-Host -Prompt "Enter the name of the VM: "
-    Write-Host "Getting 1-week vMotion events for $TargetVM" -ForegroundColor DarkGreen -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $TargetVM) | Get-VMotion -Days 7 | Format-List *
+    Write-Verbose "Getting 1-week vMotion events for $TargetVM"
+    $TargetVM | Get-VMotion -Days 7 | Format-List *
 }
 
 function Get-WeeklyVmotion4All {
-    Write-Host "Getting 1-week vMotion events for $VM" -ForegroundColor DarkGreen -BackgroundColor Black
-    (VMware.VimAutomation.Core\Get-VM $VM) | Get-VMotion -Days 7 | Format-List *
+    Write-Verbose "Getting 1-week vMotion events for $VM"
+    $VM | Get-VMotion -Days 7 | Format-List *
 }
 
-<# EXECUTE INTERACTIVE MENU #>
-do {
-    Show-Menu
-    $selection = Read-Host "Please make a selection"
-    switch ($selection) {
-        <# VCENTER AND LIST VERIFICATION #>
-        '1' {
-            'Connecting to vCenter...'
-            Connect-2vCenter
-        }
-        '2' {
-            'Disconnecting from vCenter...'
-            Disconnect-VIServer -Server * -Force -Confirm:$false
-        }
-        '3' {
-            'Getting list of VMs...'
-            Get-Content -Path $VMListPath
-        }
-        '4' {
-            'Checking list of VMs for existence in vCenter...'
-            foreach ($VM in $VMs) {
-                Get-LocationOfVMs
-            }
-        }
+if ($Action -eq 'help') { Show-Menu; return }
+if ($Action -eq 'q') { return }
+if ($Action -eq '3') { Get-Content -LiteralPath $VMListPath; return }
+if ($Action -eq '1') {
+    if (!$Server -or !$vCenterCredential -or [WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Supply one exact -Server and -vCenterCredential.' }
+    Connect-2vCenter
+    return
+}
+if ($Action -eq '13a') {
+    if (!$DomainCredential -or (!$DCIP -and (!$DC -or !$Domain))) { throw 'Supply domain credentials and a directory server.' }
+    Test-ADAuthentication
+    return
+}
+if (-not $Server) {
+    $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+    $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+    if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+    $Server = $connections[0]
+}
+if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
 
-        <# WINDOWS ADMIN ACCOUNTS #>
-        '11a' {
-            'Getting users in Admins group on specific VM...'
-            Get-UsersInAdminGroup
-        }
-        '11b' {
-            'Getting users in Admins group on each VM...'
-            foreach ($VM in $VMs) {
-                Get-UsersInAdminGroupAll
-            }
-        }
-        '12a' {
-            'Adding ADMT account to Admins group on specific VM...'
-            Add-Account2Group
-        }
-        '12b' {
-            'Adding ADMT account to Admins group on each VM...'
-            foreach ($VM in $VMs) {
-                Add-Account2GroupAll
-            }
-        }
-        '13a' {
-            'Testing authentication of ADMT account...'
-            Test-ADAuthentication
-        }
+if ($Action -in '12a', '12b' -and !$DomainCredential) { throw 'Supply -DomainCredential for the account name.' }
+if ($Action -like '24*' -and (!$PrimaryDnsServer -or !$SecondaryDnsServer)) { throw 'Supply both DNS server addresses.' }
+if ($Action -like '32*' -and !$ServiceAccountMatch) { throw 'Supply -ServiceAccountMatch.' }
+if ($Action -in '44a', '44b' -and (!$DC -or !$Domain)) { throw 'Supply -DC and -Domain.' }
+if ($Action -in '44c', '48a', '48b' -and !$DCIP) { throw 'Supply -DCIP.' }
+if ($Action -like '81*' -and (!$GuestCredential -or !$DomainCredential -or !$Domain)) { throw 'Supply -GuestCredential, -DomainCredential and -Domain.' }
+if ($Action.EndsWith('b', [StringComparison]::OrdinalIgnoreCase) -or $Action -eq '44c' -or $Action -eq '4') {
+    $names = @(Get-Content -LiteralPath $VMListPath | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+    $VMs = if ($Action -eq '4') { $names } else { foreach ($name in $names) { Get-ExactVM $name } }
+}
+elseif ($Action.EndsWith('a', [StringComparison]::OrdinalIgnoreCase)) { $TargetVM = Get-ExactVM $VMName }
+switch ($Action) {
 
-        <# IP AND DNS ADDRESSES #>
-        '21a' {
-            'Getting IP Address for each VM...'
-            Get-IPAddress4VM
-        }
-        '21b' {
-            'Getting IP Address for each VM...'
-            foreach ($VM in $VMs) {
-                Get-IPAddress4VMAll
-            }
-        }
-        '22a' {
-            'Getting Domain for each VM...'
-            Get-DomainOnVM
-        }
-        '22b' {
-            'Getting Domain for each VM...'
-            foreach ($VM in $VMs) {
-                Get-DomainOnVMAll
-            }
-        }
-        '23a' {
-            'Getting DNS Server Address on specific VM...'
-            Get-DNSServerAddress
-        }
-        '23b' {
-            'Getting DNS Server Address for each VM...'
-            foreach ($VM in $VMs) {
-                Get-DNSServerAddressAll
-            }
-        }
-        '24a' {
-            'Setting the DNS Server Address on specific VM...'
-            Set-DNSServerAddress
-        }
-        '24b' {
-            'Setting the DNS Server Address on each VM...'
-            foreach ($VM in $VMs) {
-                Set-DNSServerAddressAll
-            }
-        }
-        '25a' {
-            'Registering DNS on specific VM...'
-            Invoke-RegisterDNS
-        }
-        '25b' {
-            'Registering DNS on each VM...'
-            foreach ($VM in $VMs) {
-                Invoke-RegisterDNSAll
-            }
-        }
-
-        <# WINDOWS SERVICES #>
-        '31a' {
-            'Getting list of all Services on specific VM...'
-            Get-ServicesOnVM
-        }
-        '31b' {
-            'Getting list of all Services on each VM...'
-            foreach ($VM in $VMs) {
-                Get-ServicesAll
-            }
-        }
-        '32a' {
-            'Finding Service on specific VM...'
-            Get-SpecificSVC
-        }
-        '32b' {
-            'Finding Service on each VM...'
-            foreach ($VM in $VMs) {
-                Get-SpecificSVCAll
-            }
-        }
-
-        <# NETWORK CONNECTIVITY #>
-        '41a' {
-            'Pinging specific VM by ComputerName...'
-            Get-PingStatus
-        }
-        '41b' {
-            'Pinging each VM by ComputerName...'
-            foreach ($VM in $VMs) {
-                Get-PingStatusAll
-            }
-        }
-        '42a' {
-            'Pinging specific VM by IP...'
-            Get-PingStatusIP
-        }
-        '42b' {
-            'Pinging each VM by IP...'
-            foreach ($VM in $VMs) {
-                Get-PingStatusIPAll
-            }
-        }
-        '43a' {
-            'Pinging the Admin share on each VM...'
-            Get-PingStatusAdmin
-        }
-        '43b' {
-            'Pinging the Admin share on each VM...'
-            foreach ($VM in $VMs) {
-                Get-PingStatusAdminAll
-            }
-        }
-        '44a' {
-            'Testing reachability of DC on specific VM...'
-            Test-ReachDomain
-        }
-        '44b' {
-            'Testing reachability of DC from each VM...'
-            foreach ($VM in $VMs) {
-                Test-ReachDomainAll
-            }
-        }
-        '44c' {
-            'Testing reachability of DC IP from each VM...'
-            foreach ($VM in $VMs) {
-                Test-ReachDomainDCIP
-            }
-        }
-
-        <# WINDOWS FIREWALL #>
-        '51a' {
-            'Getting status of Windows Firewall on specific VM...'
-            Get-WinFirewallStatus
-        }
-        '51b' {
-            'Getting status of Windows Firewall on each VM...'
-            foreach ($VM in $VMs) {
-                Get-WinFirewallStatusAll
-            }
-        }
-        '52a' {
-            'Disabling Windows Firewall on specific VM...'
-            Set-WinFirewallOff
-        }
-        '52b' {
-            'Disabling Windows Firewall on each VM...'
-            foreach ($VM in $VMs) {
-                Set-WinFirewallOffAll
-            }
-        }
-
-        <# BACKUP POLICY #>
-        '61a' {
-            'Show list of VMs with Backup Policy set to Exclude...'
-            Show-BackupPolicyExclude
-        }
-        '61b' {
-            'Show list of VMs with Backup Policy set to Exclude...'
-            foreach ($VM in $VMs) {
-                Show-BackupPolicyExcludeAll
-            }
-        }
-        '62a' {
-            'Show list of VMs with Backup Policy set to Snapshot...'
-            Show-BackupPolicySnapshot
-        }
-        '62b' {
-            'Show list of VMs with Backup Policy set to Snapshot...'
-            foreach ($VM in $VMs) {
-                Show-BackupPolicySnapshotAll
-            }
-        }
-        '64a' {
-            'Set Backup Policy to Exclude on each VM...'
-            Set-BackupPolicy2Exclude
-        }
-        '64b' {
-            'Set Backup Policy to Exclude on each VM...'
-            foreach ($VM in $VMs) {
-                Set-BackupPolicy2ExcludeAll
-            }
-        }
-        '65a' {
-            'Set Backup Policy to Snapshot on each VM...'
-            Set-BackupPolicy2Snapshot
-        }
-        '65b' {
-            'Set Backup Policy to Snapshot on each VM...'
-            foreach ($VM in $VMs) {
-                Set-BackupPolicy2SnapshotAll
-            }
-        }
-
-        <# SNAPSHOTS #>
-        '71a' {
-            'Take Snapshot of specific VM...'
-            New-Snap4Salvation
-        }
-        '71b' {
-            'Take Snapshot of each VM...'
-            foreach ($VM in $VMs) {
-                New-Snap4SalvationAll
-            }
-        }
-        '72a' {
-            'Remove Snapshots of specific VM...'
-            Remove-AllSnapshots4VM
-        }
-        '72b' {
-            'Remove Snapshots of each VM...'
-            foreach ($VM in $VMs) {
-                Remove-AllSnapshots4All
-            }
-        }
-
-        <# MANUAL MOVES #>
-        '81a' {
-            'Manually moving specific VM...'
-            Add-VM2NewDomain
-        }
-        '81b' {
-            'Manually moving each VM...'
-            foreach ($VM in $VMs) {
-                Add-VM2NewDomainAll
-            }
-        }
-
-        <# VMWARE TOOLS STATUS #>
-        '91a' {
-            'Getting VMware Tools Status on VM...'
-            Get-VMwareToolsStatusOfVM
-        }
-        '91b' {
-            'Getting VMware Tools Status on VMs...'
-            foreach ($VM in $VMs) {
-                Get-VMwareToolsStatusOfVMAll
-            }
-        }
-        '92a' {
-            'Updating VMware Tools on VM...'
-            Update-VmWareToolsOnVM
-        }
-        '92b' {
-            'Updating VMware Tools on VMs...'
-            foreach ($VM in $VMs) {
-                Update-VmWareToolsOnVMAll
-            }
-        }
-
-        <# VM POWER AND REBOOT #>
-        '101a' {
-            'Getting Power Status of VM...'
-            Get-PowerStatusOfVM
-        }
-        '101b' {
-            'Getting Power Status of VMs...'
-            foreach ($VM in $VMs) {
-                Get-PowerStatusOfVMAll
-            }
-        }
-        '102A' {
-            'Getting list of VMs...'
-            Invoke-RebootOfVM
-        }
-        '103A' {
-            'Powering On specific VM...'
-            Start-PoweredOffVM
-        }
-        '104A' {
-            'Shutting Down specific VM...'
-            Invoke-ShutdownOfVM
-        }
-        '105A' {
-            'Powering Off specific VM...'
-            Invoke-PowerOffOfVM
-        }
-
-        <# VMOTION#>
-        '111a' {
-            'Getting 24-hour vMotion events of VM...'
-            Get-DailyVmotion4VM
-        }
-        '111b' {
-            'Getting 24-hour vMotion events of VMs...'
-            foreach ($VM in $VMs) {
-                Get-DailyVmotion4All
-            }
-        }
-        '112a' {
-            'Getting 1-week vMotion events of VM...'
-            Get-WeeklyVmotion4VM
-        }
-        '112b' {
-            'Getting 1-week vMotion events of VMs...'
-            foreach ($VM in $VMs) {
-                Get-WeeklyVmotion4All
-            }
-        }
-
-        <# VM CPU AND MEMORY #>
-        '121a' {
-            'Checking CPU and Memory on VM...'
-            Get-WeeklyCPURAM4VM
-        }
-        '121b' {
-            'Checking CPU and Memory on VMs...'
-            foreach ($VM in $VMs) {
-                Get-WeeklyCPURAM4All
-            }
-        }
-        '122a' {
-            'Checking CPU and Memory on VM...'
-            Get-MonthlyCPURAM4VM
-        }
-        '122b' {
-            'Checking CPU and Memory on VMs...'
-            foreach ($VM in $VMs) {
-                Get-MonthlyCPURAM4All
-            }
+    <# VCENTER AND LIST VERIFICATION #>
+    '2' {
+        'Disconnecting from vCenter...'
+        Disconnect-VIServer -Server $Server -Confirm:$false
+    }
+    '4' {
+        'Checking list of VMs for existence in vCenter...'
+        foreach ($VM in $VMs) {
+            Get-LocationOfVM
         }
     }
-    pause
+
+    <# WINDOWS ADMIN ACCOUNTS #>
+    '11a' {
+        'Getting users in Admins group on specific VM...'
+        Get-UsersInAdminGroup
+    }
+    '11b' {
+        'Getting users in Admins group on each VM...'
+        foreach ($VM in $VMs) {
+            Get-UsersInAdminGroupAll
+        }
+    }
+    '12a' {
+        'Adding ADMT account to Admins group on specific VM...'
+        Add-Account2Group
+    }
+    '12b' {
+        'Adding ADMT account to Admins group on each VM...'
+        foreach ($VM in $VMs) {
+            Add-Account2GroupAll
+        }
+    }
+
+    <# IP AND DNS ADDRESSES #>
+    '21a' {
+        'Getting IP Address for each VM...'
+        Get-IPAddress4VM
+    }
+    '21b' {
+        'Getting IP Address for each VM...'
+        foreach ($VM in $VMs) {
+            Get-IPAddress4VMAll
+        }
+    }
+    '22a' {
+        'Getting Domain for each VM...'
+        Get-DomainOnVM
+    }
+    '22b' {
+        'Getting Domain for each VM...'
+        foreach ($VM in $VMs) {
+            Get-DomainOnVMAll
+        }
+    }
+    '23a' {
+        'Getting DNS Server Address on specific VM...'
+        Get-DNSServerAddress
+    }
+    '23b' {
+        'Getting DNS Server Address for each VM...'
+        foreach ($VM in $VMs) {
+            Get-DNSServerAddressAll
+        }
+    }
+    '24a' {
+        'Setting the DNS Server Address on specific VM...'
+        Set-DNSServerAddress
+    }
+    '24b' {
+        'Setting the DNS Server Address on each VM...'
+        foreach ($VM in $VMs) {
+            Set-DNSServerAddressAll
+        }
+    }
+    '25a' {
+        'Registering DNS on specific VM...'
+        Invoke-RegisterDNS
+    }
+    '25b' {
+        'Registering DNS on each VM...'
+        foreach ($VM in $VMs) {
+            Invoke-RegisterDNSAll
+        }
+    }
+
+    <# WINDOWS SERVICES #>
+    '31a' {
+        'Getting list of all Services on specific VM...'
+        Get-ServicesOnVM
+    }
+    '31b' {
+        'Getting list of all Services on each VM...'
+        foreach ($VM in $VMs) {
+            Get-ServicesAll
+        }
+    }
+    '32a' {
+        'Finding Service on specific VM...'
+        Get-SpecificSVC
+    }
+    '32b' {
+        'Finding Service on each VM...'
+        foreach ($VM in $VMs) {
+            Get-SpecificSVCAll
+        }
+    }
+
+    <# NETWORK CONNECTIVITY #>
+    '41a' {
+        'Pinging specific VM by ComputerName...'
+        Get-PingStatus
+    }
+    '41b' {
+        'Pinging each VM by ComputerName...'
+        foreach ($VM in $VMs) {
+            Get-PingStatusAll
+        }
+    }
+    '42a' {
+        'Pinging specific VM by IP...'
+        Get-PingStatusIP
+    }
+    '42b' {
+        'Pinging each VM by IP...'
+        foreach ($VM in $VMs) {
+            Get-PingStatusIPAll
+        }
+    }
+    '43a' {
+        'Pinging the Admin share on each VM...'
+        Get-PingStatusAdmin
+    }
+    '43b' {
+        'Pinging the Admin share on each VM...'
+        foreach ($VM in $VMs) {
+            Get-PingStatusAdminAll
+        }
+    }
+    '44a' {
+        'Testing reachability of DC on specific VM...'
+        Test-ReachDomain
+    }
+    '44b' {
+        'Testing reachability of DC from each VM...'
+        foreach ($VM in $VMs) {
+            Test-ReachDomainAll
+        }
+    }
+    '44c' {
+        'Testing reachability of DC IP from each VM...'
+        foreach ($VM in $VMs) {
+            Test-ReachDomainDCIP
+        }
+    }
+
+    '48a' { Test-ADMTPort }
+    '48b' { foreach ($VM in $VMs) { Test-ADMTPortsAll } }
+    <# WINDOWS FIREWALL #>
+    '51a' {
+        'Getting status of Windows Firewall on specific VM...'
+        Get-WinFirewallStatus
+    }
+    '51b' {
+        'Getting status of Windows Firewall on each VM...'
+        foreach ($VM in $VMs) {
+            Get-WinFirewallStatusAll
+        }
+    }
+    '52a' {
+        'Disabling Windows Firewall on specific VM...'
+        Set-WinFirewallOff
+    }
+    '52b' {
+        'Disabling Windows Firewall on each VM...'
+        foreach ($VM in $VMs) {
+            Set-WinFirewallOffAll
+        }
+    }
+
+    <# BACKUP POLICY #>
+    '61a' {
+        'Show list of VMs with Backup Policy set to Exclude...'
+        Show-BackupPolicyExclude
+    }
+    '61b' {
+        'Show list of VMs with Backup Policy set to Exclude...'
+        foreach ($VM in $VMs) {
+            Show-BackupPolicyExcludeAll
+        }
+    }
+    '62a' {
+        'Show list of VMs with Backup Policy set to Snapshot...'
+        Show-BackupPolicySnapshot
+    }
+    '62b' {
+        'Show list of VMs with Backup Policy set to Snapshot...'
+        foreach ($VM in $VMs) {
+            Show-BackupPolicySnapshotAll
+        }
+    }
+    '64a' {
+        'Set Backup Policy to Exclude on each VM...'
+        Set-BackupPolicy2Exclude
+    }
+    '64b' {
+        'Set Backup Policy to Exclude on each VM...'
+        foreach ($VM in $VMs) {
+            Set-BackupPolicy2ExcludeAll
+        }
+    }
+    '65a' {
+        'Set Backup Policy to Snapshot on each VM...'
+        Set-BackupPolicy2Snapshot
+    }
+    '65b' {
+        'Set Backup Policy to Snapshot on each VM...'
+        foreach ($VM in $VMs) {
+            Set-BackupPolicy2SnapshotAll
+        }
+    }
+
+    <# SNAPSHOTS #>
+    '71a' {
+        'Take Snapshot of specific VM...'
+        New-Snap4Salvation
+    }
+    '71b' {
+        'Take Snapshot of each VM...'
+        foreach ($VM in $VMs) {
+            New-Snap4SalvationAll
+        }
+    }
+    '72a' {
+        'Remove Snapshots of specific VM...'
+        Remove-AllSnapshots4VM
+    }
+    '72b' {
+        'Remove Snapshots of each VM...'
+        foreach ($VM in $VMs) {
+            Remove-AllSnapshots4All
+        }
+    }
+
+    <# MANUAL MOVES #>
+    '81a' {
+        'Manually moving specific VM...'
+        Add-VM2NewDomain
+    }
+    '81b' {
+        'Manually moving each VM...'
+        foreach ($VM in $VMs) {
+            Add-VM2NewDomainAll
+        }
+    }
+
+    <# VMWARE TOOLS STATUS #>
+    '91a' {
+        'Getting VMware Tools Status on VM...'
+        Get-VMwareToolsStatusOfVM
+    }
+    '91b' {
+        'Getting VMware Tools Status on VMs...'
+        foreach ($VM in $VMs) {
+            Get-VMwareToolsStatusOfVMAll
+        }
+    }
+    '92a' {
+        'Updating VMware Tools on VM...'
+        Update-VmWareToolsOnVM
+    }
+    '92b' {
+        'Updating VMware Tools on VMs...'
+        foreach ($VM in $VMs) {
+            Update-VmWareToolsOnVMAll
+        }
+    }
+
+    <# VM POWER AND REBOOT #>
+    '101a' {
+        'Getting Power Status of VM...'
+        Get-PowerStatusOfVM
+    }
+    '101b' {
+        'Getting Power Status of VMs...'
+        foreach ($VM in $VMs) {
+            Get-PowerStatusOfVMAll
+        }
+    }
+    '102A' {
+        'Getting list of VMs...'
+        Invoke-RebootOfVM
+    }
+    '103A' {
+        'Powering On specific VM...'
+        Start-PoweredOffVM
+    }
+    '104A' {
+        'Shutting Down specific VM...'
+        Invoke-ShutdownOfVM
+    }
+    '105A' {
+        'Powering Off specific VM...'
+        Invoke-PowerOffOfVM
+    }
+
+    <# VMOTION#>
+    '111a' {
+        'Getting 24-hour vMotion events of VM...'
+        Get-DailyVmotion4VM
+    }
+    '111b' {
+        'Getting 24-hour vMotion events of VMs...'
+        foreach ($VM in $VMs) {
+            Get-DailyVmotion4All
+        }
+    }
+    '112a' {
+        'Getting 1-week vMotion events of VM...'
+        Get-WeeklyVmotion4VM
+    }
+    '112b' {
+        'Getting 1-week vMotion events of VMs...'
+        foreach ($VM in $VMs) {
+            Get-WeeklyVmotion4All
+        }
+    }
+
+    <# VM CPU AND MEMORY #>
+    '121a' {
+        'Checking CPU and Memory on VM...'
+        Get-WeeklyCPURAM4VM
+    }
+    '121b' {
+        'Checking CPU and Memory on VMs...'
+        foreach ($VM in $VMs) {
+            Get-WeeklyCPURAM4All
+        }
+    }
+    '122a' {
+        'Checking CPU and Memory on VM...'
+        Get-MonthlyCPURAM4VM
+    }
+    '122b' {
+        'Checking CPU and Memory on VMs...'
+        foreach ($VM in $VMs) {
+            Get-MonthlyCPURAM4All
+        }
+    }
 }
-until (
-    $selection -eq 'q'
-)

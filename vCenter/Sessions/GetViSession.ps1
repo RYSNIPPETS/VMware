@@ -1,3 +1,9 @@
+[CmdletBinding()]
+param(
+    $Server
+)
+
+$ErrorActionPreference = 'Stop'
 function Get-ViSession {
     <#
     .SYNOPSIS
@@ -40,9 +46,11 @@ function Get-ViSession {
                 FullName       = $sessionInfo.FullName
                 LoginTime      = $sessionInfo.LoginTime.ToLocalTime()
                 LastActiveTime = $sessionInfo.LastActiveTime.ToLocalTime()
-                Status         = if ($sessionInfo.Key -eq $sessionMgr.CurrentSession.Key) { "Current Session" } else { "Idle" }
+                Status         = if ($sessionInfo.Key -eq $sessionMgr.CurrentSession.Key) { "Current Session" } else { "Other Session" }
                 IdleMinutes    = [Math]::Round(((Get-Date) - $sessionInfo.LastActiveTime.ToLocalTime()).TotalMinutes)
             }
         }
     }
 }
+
+if ($MyInvocation.InvocationName -ne '.') { Get-ViSession @PSBoundParameters }

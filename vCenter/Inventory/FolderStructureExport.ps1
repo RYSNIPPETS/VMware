@@ -1,98 +1,79 @@
-﻿filter Get-FolderPath {
-    <#
-    .SYNOPSIS
-    Collates the full folder Path
-    .DESCRIPTION
-    The function will find the full folder Path returning a name and Path
-    .NOTES
-    Source:  Automating vSphere Administration
-    #>
-    $_ | Get-View | ForEach-Object {
-        $Row = "" | Select-Object Name, Path
-        $Row.Name = $_.Name
-        $Current = Get-View $_.Parent
-        $Path = $_.Name
-        do {
-            $parent = $Current
-            if($parent.Name -ne "vm"){
-    ​           $Path = $parent.Name + "\" + $Path
-            }
-            $Current = Get-View $Current.Parent
+[CmdletBinding()]
+param(
+    $Server,
+    [string]$DC,
+    [ValidateSet('Blue', 'Yellow')][string]$FolderType = 'Blue',
+    [string]$Filename = './BlueFolders.csv',
+    [string]$VMLocationPath
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Get-SingleItem {
+    param([object[]]$Items, [string]$Description)
+    if ($Items.Count -ne 1 -or $null -eq $Items[0]) { throw "Expected one $Description. Found $($Items.Count)." }
+    $Items[0]
+}
+
+function Get-InventoryRoot {
+    param($Server, [string]$DC, [string]$Kind)
+    if (!$DC) { throw 'Supply an exact datacenter name.' }
+    $location = Get-SingleItem @(Get-Datacenter -Server $Server | Where-Object Name -CEQ $DC) 'matching datacenter'
+    $ref = if ($Kind -eq 'Yellow') { $location.ExtensionData.HostFolder } else { $location.ExtensionData.VmFolder }
+    Get-SingleItem @(Get-Folder -Id "Folder-$($ref.Value)" -Server $Server) 'inventory root folder'
+}
+function Get-ChildFolder {
+    param($Parent, $Server)
+    Get-Folder -Location $Parent -NoRecursion -Server $Server | Where-Object { $_.ExtensionData.Parent.Value -eq $Parent.ExtensionData.MoRef.Value }
+}
+function Write-FolderRow {
+    param($Folder, $Root, $Server, $DC, [string[]]$Parts, [switch]$VMs)
+    if ($VMs) {
+        $instance = $Root.ExtensionData.Client.ServiceContent.About.InstanceUuid
+        foreach ($ref in $Folder.ExtensionData.ChildEntity | Where-Object Type -EQ 'VirtualMachine') {
+            $view = Get-View -Id $ref -Server $Server -Property Name, Config.Template
+            if ($view.Config.Template) { continue }
+            [pscustomobject]@{ Datacenter = $DC; Root = $Root.Name; Name = $view.Name; PathParts = (ConvertTo-Json -InputObject @($Parts | Where-Object { $_ }) -Compress); VMId = "VirtualMachine-$($ref.Value)"; ServerInstanceUuid = $instance }
         }
-        while ($null -ne $Current.Parent)
-        $Row.Path = $Path
-        $Row
+    }
+    foreach ($child in (Get-ChildFolder $Folder $Server)) {
+        $childParts = @($Parts | Where-Object { $_ }) + $child.Name
+        if (!$VMs) {
+            [pscustomobject]@{ Datacenter = $DC; Root = $Root.Name; Name = $child.Name; PathParts = (ConvertTo-Json -InputObject $childParts -Compress); Path = (@($Root.Name) + $childParts -join '\') }
+        }
+        Write-FolderRow -Folder $child -Root $Root -Server $Server -DC $DC -Parts $childParts -VMs:$VMs
     }
 }
-############################################################
 function Export-Folder {
-    <#
-    .SYNOPSIS
-    Creates a csv file of folders in vCenter Server.
-    .DESCRIPTION
-    The function will export folders from vCenter Server and add them to a CSV file.
-    .NOTES
-    Source: Automating vSphere Administration
-    .PARAMETER FolderType
-    The type of folder to export
-    .PARAMETER DC
-    The Datacenter where the folders reside
-    .PARAMETER Filename
-    The Path of the CSV file to use when exporting
-    .EXAMPLE
-    Export-Folders -FolderType "Blue" -DC "DC01" -Filename "C:\BlueFolders.csv"
-    .EXAMPLE
-    Export-Folders -FolderType "Yellow" -DC "Datacenter" -Filename "C:\YellowFolders.csv"
-    #>
-    param(
-        [String]$FolderType,
-        [String]$DC,
-        [String]$Filename
-    )
-    Process {
-    ​   If ($Foldertype -eq "Yellow") {
-            $type = "host"
-        }
-        Else {
-            $type = "vm"
-        }
-        $report = @()
-        $report = Get-Datacenter $DC | Get-Folder $type | Get-Folder | Get-FolderPath
-        $report | Foreach-Object {
-            if ($type -eq "vm") {
-                $_.Path = ($_.Path).Replace($DC + "\","$type\")
-            }
-        }
-        $report | Export-Csv $Filename -NoTypeInformation
+    param([ValidateSet('Blue', 'Yellow')][string]$FolderType, [string]$DC, [string]$Filename, $Server)
+    if (-not $Server) {
+        $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+        $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+        if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+        $Server = $connections[0]
     }
+    if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+
+    $root = Get-InventoryRoot -Server $Server -DC $DC -Kind $FolderType
+    Write-FolderRow -Folder $root -Root $root -Server $Server -DC $DC -Parts @() | Export-Csv -LiteralPath $Filename
 }
-############################################################
 function Export-VMLocation {
-    <#
-    .SYNOPSIS
-    Creates a csv file with the folder location of each VM.
-    .DESCRIPTION
-    The function will export VM locations from vCenter Server and add them to a CSV file.
-    .NOTES
-    Source: Automating vSphere Administration
-    .PARAMETER DC
-    The Datacenter where the folders reside
-    .PARAMETER Filename
-    The Path of the CSV file to use when exporting
-    .EXAMPLE
-    Export-VMLocation -DC "DC01" -Filename "C:\VMLocations.csv"
-    #>
-    param(
-        [String]$DC,
-        [String]$Filename
-    )
-    Process {
-        $report = @()
-        $report = Get-Datacenter $DC | Get-VM | Get-FolderPath
-        $report | Export-Csv $Filename -NoTypeInformation
+    param([string]$DC, [string]$Filename, $Server)
+    if (-not $Server) {
+        $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+        if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+        $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+        if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+        $Server = $connections[0]
     }
+    if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+
+    $root = Get-InventoryRoot -Server $Server -DC $DC -Kind Blue
+    Write-FolderRow -Folder $root -Root $root -Server $Server -DC $DC -Parts @() -VMs | Export-Csv -LiteralPath $Filename
 }
-############################################################
-Export-Folders "Blue" "DC01" "C:\BlueFolders.csv"
-Export-VMLocation "DC01" "C:\VMLocation.csv"
-Export-Folders "Yellow" "DC01" "C:\YellowFolders.csv"
+if ($MyInvocation.InvocationName -ne '.') {
+    if (!$PSBoundParameters.ContainsKey('Filename') -and $FolderType -eq 'Yellow') { $Filename = './YellowFolders.csv' }
+    Export-Folder -FolderType $FolderType -DC $DC -Filename $Filename -Server $Server
+    if ($VMLocationPath) { Export-VMLocation -DC $DC -Filename $VMLocationPath -Server $Server }
+}

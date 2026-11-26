@@ -1,3 +1,14 @@
+[CmdletBinding()]
+param(
+    [string]$VMHost,
+    [string]$LicKey,
+    [string]$TypeId = 'vmware-vsphere',
+    [string]$Name,
+    $Server
+)
+
+$ErrorActionPreference = 'Stop'
+
 function Set-LicenseKey {
     <#
     .SYNOPSIS
@@ -29,12 +40,27 @@ function Set-LicenseKey {
 
         [string]$TypeId = "vmware-vsphere",
 
-        [string]$Name
+        [string]$Name,
+        $Server
     )
 
     process {
-        $vmHostObject = Get-VMHost -Name $VMHost -ErrorAction Stop
-        $licenseDataManager = Get-LicenseDataManager
+        if (-not $Server) {
+            $defaults = Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+            if (!$defaults) { $defaults = Get-Variable -Name DefaultVIServer -Scope Global -ValueOnly -ErrorAction SilentlyContinue }
+            $connections = @($defaults | Where-Object { $_ -and $_.IsConnected })
+            if ($connections.Count -ne 1) { throw 'Specify -Server when there is not exactly one default vCenter connection.' }
+            $Server = $connections[0]
+        }
+        if ([WildcardPattern]::ContainsWildcardCharacters([string]$Server)) { throw 'Specify one exact vCenter server.' }
+
+        $about = (Get-View ServiceInstance -Server $Server -ErrorAction Stop).Content.About
+        if (!$about.Version) { throw 'Unable to identify vCenter version.' }
+        if ([version]$about.Version -ge [version]'9.0') { throw 'Use VCF Operations subscription licensing for vSphere 9 or later (Broadcom KB 428638).' }
+        $targets = @(Get-VMHost -Server $Server -Name ([WildcardPattern]::Escape($VMHost)) | Where-Object Name -CEQ $VMHost)
+        if ($targets.Count -ne 1) { throw 'Expected one exact host on the selected vCenter.' }
+        $vmHostObject = $targets[0]
+        $licenseDataManager = Get-LicenseDataManager -Server $Server
 
         $licenseData = New-Object Vmware.VimAutomation.License.Types.LicenseData
         $licenseKeyEntry = New-Object Vmware.VimAutomation.License.Types.LicenseKeyEntry
@@ -51,9 +77,12 @@ function Set-LicenseKey {
             $licenseDataManager.ApplyAssociatedLicenseData($vmHostObject.Uid)
         }
 
-        Get-VMHost -Name $vmHostObject.Name | Select-Object Name, LicenseKey, Uid
+        Get-VMHost -Server $Server -Id $vmHostObject.Id | Select-Object Name, LicenseKey, Uid
     }
 }
 
-# Example:
-# Set-LicenseKey -LicKey "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE" -VMHost "esxhost01.contoso.com"
+
+if ($MyInvocation.InvocationName -ne '.') {
+    if (!$VMHost -or !$LicKey) { throw 'Supply -VMHost and -LicKey.' }
+    Set-LicenseKey @PSBoundParameters
+}

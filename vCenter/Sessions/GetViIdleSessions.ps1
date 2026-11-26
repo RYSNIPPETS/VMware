@@ -1,67 +1,22 @@
-﻿Function Get-ViIdleSession{
-    <#
-    .SYNOPSIS
-    Get Idle sessions from vcenters
-    .DESCRIPTION
-    This script gets all the sessions in the last 8 hours inactive
-    .NOTES
-    Authors:  Guilherme Alves Stela
-                Mauro Bonder
-    .PARAMETER vclist
-    This parameter specifies the connection(s) to any vcenters wanted.
+[CmdletBinding()]
+param(
+    $vclist,
+    [string[]]$excluded,
+    [ValidateRange(1, 8760)][int]$Hours = 8
+)
 
-    .PARAMETER excluded
-    This parameter specifies the file container of the list of users who will be excluded from the output list of inactive sessions.
-    .EXAMPLE
-    $vcs = Connect-viserver -Server "myserver" -AllLinked:$true
-    $usersToExclude = Get-content (myfile.txt)
-    Get-viIdleSessions -vclist $vcs -excluded $usersToExclude
+$ErrorActionPreference = 'Stop'
 
-    This command retrieves information about all users logged on the servers specified in the variable $vcs
-    #>
-    param($vclist,$excluded)
-    $report=@()
-    foreach($vc in $vclist){
-        $sessMgr = Get-View SessionManager -Server $vc
-        #Loop under SessionManager from vcenter
-        foreach($sess in $sessMgr){
-            #Get All Sessions
-            foreach($subsess in $sess.Sessionlist){
-                #if last active time less than 8 hours, add to oldsessions list
-                if(((($subsess.LastActiveTime).AddHours(8)) -lt (Get-date)) -and ($excluded -notcontains $subSess.Username)){
-                    $row ="" | Select-Object Username,FullName,TimeStamp,Server,LoginTime,LastActiveTime,Key
-                    $row.Username = $subsess.UserName
-                    $row.FullName = $subsess.FullName
-                    $row.TimeStamp = Get-Date
-                    $row.Server = $vc.Name
-                    $row.LoginTime = $subsess.LoginTime
-                    $row.LastActiveTime = $subsess.LastActiveTime
-                    $row.Key = $subsess.key
-                    $report += $row
-                }
-            }
-        }
-    }
-    return $report
-}
-<# Get Example:
-$report = Get-ViIdleSessions -vclist (connect-viserver "myserver") -excluded (Get-Content "./excluded-users.txt")
-#>
-
-# Disconnect Idle Sessions #
-Function Disconnect-ViIdleSession {
-    param($list,$vcs)
-    $list | ForEach-Object {
-        $key = $_.Key
-        $server = $_.Server
-        $vcs | ForEach-Object {
-            if($_.Name -eq $server) {
-                $SessionMgr = Get-View $_.ExtensionData.Client.ServiceContent.SessionManager
-                $SessionMgr.TerminateSession($key)
-            }
+function Get-ViIdleSession {
+    param($vclist, [string[]]$excluded, [ValidateRange(1, 8760)][int]$Hours = 8)
+    if (!$vclist) { throw 'Supply connected vCenter sessions with -vclist.' }
+    $now = Get-Date
+    foreach ($vc in $vclist) {
+        $manager = Get-View SessionManager -Server $vc -ErrorAction Stop
+        foreach ($session in $manager.SessionList) {
+            if ($session.Key -eq $manager.CurrentSession.Key -or $session.UserName -in $excluded -or $session.LastActiveTime.ToUniversalTime() -ge $now.ToUniversalTime().AddHours(-$Hours)) { continue }
+            [pscustomobject]@{ Username = $session.UserName; FullName = $session.FullName; TimeStamp = $now; Server = [string]$vc; LoginTime = $session.LoginTime; LastActiveTime = $session.LastActiveTime; Key = $session.Key; IdleHours = $Hours }
         }
     }
 }
-<# Disconnect Example:
-Disconnect-ViIdleSessions -list $Allreport -vcs $conns
-#>
+if ($MyInvocation.InvocationName -ne '.') { Get-ViIdleSession @PSBoundParameters }

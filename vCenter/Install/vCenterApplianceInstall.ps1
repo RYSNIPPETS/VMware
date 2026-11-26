@@ -8,6 +8,8 @@ param(
     [switch]$SkipDeployment
 )
 
+$ErrorActionPreference = 'Stop'
+
 function Set-JsonValueByPath {
     <#
     .SYNOPSIS
@@ -85,7 +87,7 @@ function Invoke-VcsaCliInstall {
     @{
         "/new_vcsa/esxi/hostname" = "esxi01.contoso.com"
         "/new_vcsa/esxi/username" = "root"
-        "/new_vcsa/esxi/password" = "VMware123!"
+        "/new_vcsa/esxi/password" = $password
         "/new_vcsa/appliance/name" = "vcsa01"
         "/new_vcsa/network/ip_family" = "ipv4"
         "/new_vcsa/network/mode" = "static"
@@ -93,9 +95,9 @@ function Invoke-VcsaCliInstall {
         "/new_vcsa/network/prefix" = "24"
         "/new_vcsa/network/gateway" = "10.0.0.1"
         "/new_vcsa/network/dns_servers" = @("10.0.0.5", "10.0.0.6")
-        "/new_vcsa/os/password" = "VMware123!"
+        "/new_vcsa/os/password" = $password
         "/new_vcsa/os/ntp_servers" = "0.pool.ntp.org"
-        "/new_vcsa/sso/password" = "VMware123!"
+        "/new_vcsa/sso/password" = $password
         "/new_vcsa/sso/domain_name" = "vsphere.local"
         "/new_vcsa/sso/site_name" = "Default-First-Site"
         "/ceip/settings/ceip_enabled" = $false
@@ -108,7 +110,7 @@ function Invoke-VcsaCliInstall {
     $settings = @{
         "/new_vcsa/esxi/hostname" = "esxi01.contoso.com"
         "/new_vcsa/esxi/username" = "root"
-        "/new_vcsa/esxi/password" = "VMware123!"
+        "/new_vcsa/esxi/password" = $password
         "/new_vcsa/appliance/name" = "vcsa01"
     }
     Invoke-VcsaCliInstall -InstallerPath "D:\vcsa-cli-installer\win32\vcsa-deploy.exe" `
@@ -117,12 +119,10 @@ function Invoke-VcsaCliInstall {
         -Setting $settings `
         -NoSslCertificateVerification
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
         [string]$InstallerPath,
 
-        [Parameter(Mandatory)]
         [string]$TemplatePath,
 
         [string]$OutputPath,
@@ -134,56 +134,60 @@ function Invoke-VcsaCliInstall {
         [switch]$SkipDeployment
     )
 
-    if (-not (Test-Path -Path $InstallerPath)) {
+    if (!$SkipDeployment -and (!$InstallerPath -or !(Test-Path -LiteralPath $InstallerPath -PathType Leaf))) {
         throw "Installer path [$InstallerPath] was not found."
     }
 
-    if (-not (Test-Path -Path $TemplatePath)) {
+    if (!$TemplatePath -or !(Test-Path -LiteralPath $TemplatePath -PathType Leaf)) {
         throw "Template path [$TemplatePath] was not found."
     }
 
-    if (-not $OutputPath) {
-        $OutputPath = Join-Path -Path ([System.IO.Path]::GetDirectoryName($TemplatePath)) -ChildPath "vcsa-install.generated.json"
+    $ephemeral = !$OutputPath -and !$SkipDeployment
+    if (!$OutputPath) {
+        $OutputPath = Join-Path ([IO.Path]::GetTempPath()) ("vcsa-{0}.json" -f [guid]::NewGuid())
     }
-
-    $config = Get-Content -Path $TemplatePath -Raw | ConvertFrom-Json -Depth 100
-
+    $outputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+    $templateFile = (Get-Item -LiteralPath $TemplatePath).FullName
+    if ($outputFile -eq $templateFile) { throw 'Choose an output file separate from the template.' }
+    $config = Get-Content -LiteralPath $TemplatePath -Raw | ConvertFrom-Json -Depth 100
     foreach ($entry in ($Setting.GetEnumerator() | Sort-Object Key)) {
         Set-JsonValueByPath -InputObject $config -Path $entry.Key -Value $entry.Value
     }
-
-    $outputDirectory = Split-Path -Path $OutputPath -Parent
-    if ($outputDirectory -and -not (Test-Path -Path $outputDirectory)) {
-        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-    }
-
-    $config | ConvertTo-Json -Depth 100 | Set-Content -Path $OutputPath -Encoding utf8
-
-    if ($SkipDeployment) {
-        Get-Item -Path $OutputPath
-        return
-    }
-
-    $arguments = @(
-        "install"
-        "--accept-eula"
-    )
-
-    if ($NoSslCertificateVerification) {
-        $arguments += "--no-ssl-certificate-verification"
-    }
-
-    $arguments += $OutputPath
-
-    if ($PSCmdlet.ShouldProcess($TemplatePath, "Deploy VCSA with generated config [$OutputPath]")) {
-        & $InstallerPath @arguments
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "vcsa-deploy failed with exit code $LASTEXITCODE."
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($config | ConvertTo-Json -Depth 100))
+    $directory = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($outputFile))
+    $stage = Join-Path $directory.FullName ([IO.Path]::GetRandomFileName())
+    try {
+        if ($IsWindows) {
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $acl = [Security.AccessControl.FileSecurity]::new()
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.SetOwner($sid)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'Allow'))
+            $stream = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($stage), 'CreateNew', 'FullControl', 'None', 4096, 'None', $acl)
         }
+        else {
+            $options = [IO.FileStreamOptions]::new()
+            $options.Mode = 'CreateNew'
+            $options.Access = 'Write'
+            $options.Share = 'None'
+            $options.UnixCreateMode = [IO.UnixFileMode]'UserRead,UserWrite'
+            $stream = [IO.File]::Open($stage, $options)
+        }
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+        finally { $stream.Dispose() }
+        [IO.File]::Move($stage, $outputFile, $true)
+        if ($SkipDeployment) { Get-Item -LiteralPath $outputFile; return }
+
+        $arguments = @('install', '--accept-eula')
+        if ($NoSslCertificateVerification) { $arguments += '--no-ssl-certificate-verification' }
+        $arguments += $outputFile
+        & (Get-Item -LiteralPath $InstallerPath).FullName @arguments
+        if ($LASTEXITCODE -ne 0) { throw "vcsa-deploy failed with exit code $LASTEXITCODE." }
+    }
+    finally {
+        [IO.File]::Delete($stage)
+        if ($ephemeral) { [IO.File]::Delete($outputFile) }
     }
 }
 
-if ($PSBoundParameters.Count -gt 0) {
-    Invoke-VcsaCliInstall @PSBoundParameters
-}
+if ($PSBoundParameters.Count -gt 0) { Invoke-VcsaCliInstall @PSBoundParameters }

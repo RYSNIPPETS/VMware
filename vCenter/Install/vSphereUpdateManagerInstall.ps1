@@ -18,6 +18,7 @@ function Get-LifecycleManagerDepotUrl {
     Get-LifecycleManagerDepotUrl -DownloadToken "token-value"
     #>
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
         [string]$DownloadToken
@@ -26,15 +27,19 @@ function Get-LifecycleManagerDepotUrl {
     @(
         [pscustomobject]@{
             Component = "Main"
-            Url = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/main/vmw-depot-index.xml"
+            Url       = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/main/vmw-depot-index.xml"
         }
         [pscustomobject]@{
             Component = "Addon"
-            Url = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/addon-main/vmw-depot-index.xml"
+            Url       = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/addon-main/vmw-depot-index.xml"
         }
         [pscustomobject]@{
             Component = "IOVP"
-            Url = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/iovp-main/vmw-depot-index.xml"
+            Url       = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/iovp-main/vmw-depot-index.xml"
+        }
+        [pscustomobject]@{
+            Component = 'VMware Tools'
+            Url       = "https://dl.broadcom.com/$DownloadToken/PROD/COMP/ESX_HOST/vmtools-main/vmw-depot-index.xml"
         }
     )
 }
@@ -47,21 +52,22 @@ function Get-LifecycleManagerGuidance {
     Get-LifecycleManagerGuidance
     #>
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param(
         [string]$DownloadToken
     )
 
     $guidance = @(
         [pscustomobject]@{
-            Step = 1
+            Step   = 1
             Detail = "There is no standalone Update Manager installer in current vSphere releases."
         }
         [pscustomobject]@{
-            Step = 2
+            Step   = 2
             Detail = "Use the built-in Lifecycle Manager service from the vSphere Client."
         }
         [pscustomobject]@{
-            Step = 3
+            Step   = 3
             Detail = "Open the vSphere Client and navigate to Lifecycle Manager to configure depots, images, and remediation."
         }
     )

@@ -40,12 +40,12 @@ domain-migration utilities.
 - [`GetVIEventPlus.ps1`](vCenter/Events/GetVIEventPlus.ps1) provides extended vCenter event
   retrieval.
 - [`GetViSession.ps1`](vCenter/Sessions/GetViSession.ps1) and
-  [`GetViIdleSessions.ps1`](vCenter/Sessions/GetViIdleSessions.ps1) report sessions and identify or
-  disconnect idle sessions.
+  [`GetViIdleSessions.ps1`](vCenter/Sessions/GetViIdleSessions.ps1) report sessions and identify idle sessions.
+  [`DisconnectViIdleSession.ps1`](vCenter/Sessions/DisconnectViIdleSession.ps1) rechecks each listed session before disconnecting it.
 
 ## Requirements
 
-- Windows PowerShell or PowerShell, depending on the script and target system
+- PowerShell 7.7 on the controller. Windows guest commands use the Windows components named in each script.
 - VMware PowerCLI or VCF PowerCLI with the required vSphere cmdlets
 - Network access and appropriate permissions for the target vCenter, ESXi host,
   and guest operating systems
@@ -61,10 +61,18 @@ values before running it.
 
 Some scripts make immediate infrastructure changes, including modifying cluster
 settings, guest networking, permissions, licenses, snapshots, and VMware Tools.
-A filename beginning with `Get` does not guarantee that a script is read-only.
 Test changes in a non-production environment first, use an account with only the
 permissions required for the task, and use `-WhatIf` where the script supports
 it.
 
 Some short scripts are examples intended to be customized rather than
 parameterized tools.
+
+## Inputs for unattended changes
+
+- Pass the connected vCenter with `-Server` when multiple sessions are open. Pass credentials through the script's credential parameters.
+- `ExtendDisk.ps1` takes an absolute `-TargetCapacityGB`. Windows must expose the selected VMDK's backing UUID as its disk serial number.
+- Export permissions again before importing. Restoration verifies the originating vCenter, inventory ID, type, and full path. Legacy permission CSVs lack those fields.
+- `vCenterUtility.ps1` lists its action codes when run without arguments. Supply `-Action` with `-VMName` or `-VMListPath` to run an operation. Standalone domain joins use authenticated WinRM over HTTPS.
+- The VCSA installer deletes its temporary credential file after deployment. An explicit `-OutputPath` or `-SkipDeployment` retains an owner-only file.
+- The license-key scripts apply to pre-9 vSphere environments. vSphere 9 subscription licenses are managed through VCF Operations.

@@ -21,13 +21,23 @@ function Get-VSphereClientUrl {
         [string]$Server
     )
 
-    $normalizedServer = $Server -replace "^https?://", ""
-    $normalizedServer = $normalizedServer.TrimEnd("/")
-
+    $address = $null
+    $inputName = $Server.Trim()
+    if ([ipaddress]::TryParse($inputName.Trim('[', ']'), [ref]$address)) {
+        $builder = [UriBuilder]::new('https', $address.ToString())
+    }
+    else {
+        if ($inputName -notmatch '^https?://') { $inputName = "https://$inputName" }
+        $builder = [UriBuilder]::new($inputName)
+        if (!$builder.Host -or $builder.UserName -or $builder.Password -or $builder.Query -or $builder.Fragment -or $builder.Path.Trim('/') -notin '', 'ui') { throw 'Supply a vCenter host name, IP address or client URL.' }
+        if ($builder.Scheme -eq 'http' -and $builder.Port -eq 80) { $builder.Port = -1 }
+        $builder.Scheme = 'https'
+    }
+    $builder.Path = '/ui'
     [pscustomobject]@{
-        Server = $normalizedServer
-        Url = "https://$normalizedServer/ui"
-        Note = "Use the browser-based vSphere Client. The legacy Windows client is no longer installed separately."
+        Server = $builder.Uri.Authority
+        Url    = $builder.Uri.AbsoluteUri
+        Note   = "Use the browser-based vSphere Client. The legacy Windows client is no longer installed separately."
     }
 }
 
